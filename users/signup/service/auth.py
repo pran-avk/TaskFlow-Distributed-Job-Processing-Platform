@@ -3,7 +3,7 @@ from signup.schemas.auth import UserSignupSchema
 router = APIRouter()
 from sqlalchemy.orm import Session
 from pwdlib import PasswordHash
-from signup.models.auth import User
+from users.models.auth import User
 password_hash = PasswordHash() 
 
 @APIRouter.post("/signup")
@@ -31,6 +31,7 @@ def signup(user:UserSignupSchema,db:Session):
             status_code=500,
             detail="failed to register User"
         )
+
     return{
         "message": "Signup successful",
         "user_id": new_user.id,
