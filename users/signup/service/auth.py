@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from jwtauth.auth.token import create_access_token, create_refresh_token
 from signup.schemas.auth import UserSignupSchema
 router = APIRouter()
 from sqlalchemy.orm import Session
@@ -31,12 +32,15 @@ def signup(user:UserSignupSchema,db:Session):
             status_code=500,
             detail="failed to register User"
         )
-
+    access_token=create_access_token({"user_id": new_user.id})
+    refresh_token=create_refresh_token({"user_id": new_user.id})
     return{
         "message": "Signup successful",
         "user_id": new_user.id,
         "full_name": new_user.full_name,
-        "email": new_user.email
+        "email": new_user.email,
+        "ascess_token": access_token,
+        "refresh_token": refresh_token
     }
 
 
