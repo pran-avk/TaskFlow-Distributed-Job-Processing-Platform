@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from jwtauth.auth.token import create_access_token, create_refresh_token
 from signup.schemas.auth import UserLoginSchema
 router = APIRouter()
 from sqlalchemy.orm import Session
@@ -19,7 +20,9 @@ def login(user:UserLoginSchema,db:Session):
             status_code=401,
             detail="Wrong password or invalid email"
         )
-    return {
-        "message":"login succesful",
+    access_token=create_access_token({"sub": str(existing_user.id)})
+    refreshtoken=create_refresh_token({"sub": str(existing_user.id)})
+    return{
+        "access_token": access_token,
+        "refresh_token": refreshtoken
     }
-
