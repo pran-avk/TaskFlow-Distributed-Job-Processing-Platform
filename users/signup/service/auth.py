@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from jwtauth.auth.token import create_access_token, create_refresh_token
 from users.signup.schemas.auth import UserSignupSchema
 from sqlalchemy.orm import Session

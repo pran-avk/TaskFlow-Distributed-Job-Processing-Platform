@@ -1,4 +1,3 @@
-from jwt import ExpiredSignatureError, PyJWTError
 from jwtauth.auth.token import verify_access_token
 from fastapi import HTTPException
 def get_user_details(token: str) -> dict:
