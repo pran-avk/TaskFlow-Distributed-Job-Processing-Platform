@@ -17,7 +17,7 @@ def return_refresh_access(token: str) -> dict:
             )
 
         access_token = create_access_token({
-            str(user_id)
+            "sub":str(user_id)
         })
 
         

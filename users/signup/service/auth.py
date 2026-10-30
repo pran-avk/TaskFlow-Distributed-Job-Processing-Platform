@@ -1,13 +1,15 @@
 from fastapi import APIRouter, Depends, HTTPException
 from jwtauth.auth.token import create_access_token, create_refresh_token
-from signup.schemas.auth import UserSignupSchema
-router = APIRouter()
+from users.signup.schemas.auth import UserSignupSchema
 from sqlalchemy.orm import Session
 from pwdlib import PasswordHash
 from users.models.auth import User
-password_hash = PasswordHash() 
+password_hash = PasswordHash.recommended()
+router = APIRouter(
+    prefix="/auth",
+    tags=["Authentication"]
+)
 
-@APIRouter.post("/signup")
 def signup(user:UserSignupSchema,db:Session):
     existing_user=db.query(User).filter(User.email==user.email).first()
     if existing_user:
@@ -15,7 +17,7 @@ def signup(user:UserSignupSchema,db:Session):
             status_code=409,
             detail="user already exist"   
         )
-    hashed_password1=PasswordHash(user.password)
+    hashed_password1=password_hash.hash(user.password)
     new_user=User(
         full_name=user.full_name,
         email=str(user.email),
@@ -32,8 +34,8 @@ def signup(user:UserSignupSchema,db:Session):
             status_code=500,
             detail="failed to register User"
         )
-    access_token=create_access_token({"user_id": new_user.id})
-    refresh_token=create_refresh_token({"user_id": new_user.id})
+    access_token=create_access_token({"sub": str(new_user.id)})
+    refresh_token=create_refresh_token({"sub": str(new_user.id)})
     return{
         "message": "Signup successful",
         "user_id": new_user.id,

@@ -1,6 +1,6 @@
-from auth.token import verify_access_token
+from jwt import ExpiredSignatureError, PyJWTError
+from jwtauth.auth.token import verify_access_token
 from fastapi import HTTPException
-from jose.exceptions import ExpiredSignatureError, JWTError
 def get_user_details(token: str) -> dict:
     try:
         payload = verify_access_token(token)
@@ -17,14 +17,8 @@ def get_user_details(token: str) -> dict:
             "payload": payload
         }
 
-    except ExpiredSignatureError:
+    except ValueError as e:
         raise HTTPException(
             status_code=401,
-            detail="Access token expired"
-        )
-
-    except JWTError:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid access token"
+            detail=str(e)
         )
