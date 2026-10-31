@@ -1,2 +1,14 @@
 .env
 .env*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Local SQLite databases
+*.db
+*.db-wal
+*.db-shm
