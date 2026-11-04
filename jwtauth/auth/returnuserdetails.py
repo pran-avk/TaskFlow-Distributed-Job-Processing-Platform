@@ -13,7 +13,6 @@ def get_user_details(token: str) -> dict:
         # Return user details
         return {
             "user_id": user_id,
-            "payload": payload
         }
 
     except ValueError as e:
