@@ -1,0 +1,134 @@
+# Local stack: docker compose up --build
+# API: http://localhost:8000/docs   Prometheus: http://localhost:9090   Grafana: http://localhost:3000
+#
+# Requires JWT_SECRET_KEY in .env (see .env.example).
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql+psycopg://taskflow:${POSTGRES_PASSWORD:-taskflow}@postgres:5432/taskflow
+  REDIS_URL: redis://redis:6379/0
+  JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}
+  JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+  # Must match the credentials in monitoring/prometheus.yml.
+  METRICS_TOKEN: ${METRICS_TOKEN:-dev-metrics-token}
+  METRICS_PORT: "9101"
+  LOG_JSON: "true"
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: taskflow-app
+  environment: *app-env
+  restart: unless-stopped
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_USER: taskflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taskflow}
+      POSTGRES_DB: taskflow
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskflow -d taskflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    # AOF persistence keeps queued job ids across restarts; the outbox/recovery
+    # services re-dispatch anything that is still lost.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: taskflow-app
+    environment: *app-env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *app
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health/ready')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  dispatcher:
+    <<: *app
+    command: ["python", "-m", "scheduler.dispatcher"]
+
+  scheduler:
+    <<: *app
+    command: ["python", "-m", "scheduler.scheduler"]
+
+  worker:
+    <<: *app
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    image: taskflow-worker
+    environment:
+      <<: *app-env
+      WORKER_CONCURRENCY: "4"
+      WORKER_SHUTDOWN_GRACE_SECONDS: "25"
+    stop_grace_period: 35s
+    deploy:
+      replicas: 2
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
