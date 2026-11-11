@@ -1,0 +1,53 @@
+# Starting thresholds only. Tune them from measured behaviour (README section 12).
+groups:
+  - name: taskflow
+    rules:
+      - alert: TaskFlowQueueBacklog
+        expr: sum(taskflow_queue_depth) > 1000
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Queue depth has stayed above 1000 for 10 minutes"
+
+      - alert: TaskFlowSlowQueueWait
+        expr: histogram_quantile(0.95, sum by (le) (rate(taskflow_queue_wait_seconds_bucket[5m]))) > 60
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "p95 time from eligibility to execution is above 60s"
+
+      - alert: TaskFlowHighFailureRate
+        expr: |
+          sum(rate(taskflow_jobs_completed_total{outcome!="succeeded"}[10m]))
+            / clamp_min(sum(rate(taskflow_jobs_completed_total[10m])), 1e-9) > 0.2
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "More than 20% of job attempts are failing"
+
+      - alert: TaskFlowNoHealthyWorkers
+        expr: count(taskflow_worker_heartbeat_age_seconds < 30) == 0 or absent(taskflow_worker_heartbeat_age_seconds)
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "No worker has sent a heartbeat in the last 30 seconds"
+
+      - alert: TaskFlowOutboxBacklog
+        expr: taskflow_outbox_pending_events > 500
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Outbox publication is falling behind (Redis down or dispatcher stopped?)"
+
+      - alert: TaskFlowJobsLosingLeases
+        expr: increase(taskflow_recovered_total{kind="expired_lease"}[15m]) > 10
+        labels: {severity: warning}
+        annotations:
+          summary: "Jobs are repeatedly expiring without completing"
+
+      - alert: TaskFlowTargetDown
+        expr: up{job=~"taskflow-.*"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.job }} target {{ $labels.instance }} is down (or PostgreSQL/Redis readiness failing)"
