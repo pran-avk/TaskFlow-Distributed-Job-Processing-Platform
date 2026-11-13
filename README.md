@@ -1,1163 +1,690 @@
 # TaskFlow — Distributed Job Processing Platform
 
-A distributed background job processing platform built with Python, FastAPI, PostgreSQL, Redis, and Docker. TaskFlow allows clients to submit asynchronous jobs, execute them using independent workers, track execution status, retry failures, and monitor processing performance through a REST API.
+TaskFlow is a background job processing platform built with **Python, FastAPI, PostgreSQL, Redis and Docker**. Clients submit jobs over a REST API and get a job ID back immediately. Independent workers execute the jobs, and clients poll for status and results. Failures are retried with backoff, and work lost to crashes is recovered automatically.
 
-The project focuses on backend engineering, distributed systems, concurrency control, fault tolerance, and reliable asynchronous processing.
-
----
-
-## 1. Project Overview
-
-In traditional synchronous applications, a client request may remain blocked while the server performs a long-running operation. This increases response latency, consumes application resources, and makes the system vulnerable to timeouts.
-
-TaskFlow separates job submission from job execution.
-
-Clients submit jobs through a REST API. The API validates requests and persists job metadata in PostgreSQL. Eligible jobs are dispatched through Redis to background workers, which execute them independently and update their execution status.
-
-Clients can retrieve job details, inspect failures, request retries, and monitor queue statistics without waiting for the underlying operation to finish.
-
-### Core Objectives
-
-- Build a reliable asynchronous job processing system.
-- Separate API traffic from background execution.
-- Support multiple concurrent workers.
-- Implement retries and failure recovery.
-- Prevent duplicate logical submissions through idempotency.
-- Support job priorities, scheduling, and execution timeouts.
-- Provide observability into queues, workers, and job execution.
-- Demonstrate production-oriented backend engineering practices.
+The project is about how a backend behaves under concurrency and failure, not just about running tasks in the background. It covers atomic job claiming, a transactional outbox, execution leases with fencing, idempotent submission, at-least-once delivery, and recovery from dead workers and lost queue messages.
 
 ---
 
-## 2. Technology Stack
+## Table of Contents
 
-| Component | Technology | Responsibility |
-|---|---|---|
-| Programming language | Python | Application and worker implementation |
-| API framework | FastAPI | REST API and request validation |
-| Database | PostgreSQL | Durable job metadata and execution records |
-| Database access | SQLAlchemy | ORM and database operations |
-| Schema migrations | Alembic | Version-controlled database migrations |
-| Message broker | Redis | Job dispatch and queue coordination |
-| Background workers | Python worker processes | Asynchronous job execution |
-| Authentication | JWT or secure session-based authentication | Client authentication |
-| Testing | Pytest | Unit, integration, and reliability tests |
-| Load testing | Locust or k6 | Throughput and latency measurement |
-| Containerization | Docker | Consistent runtime environments |
-| Local orchestration | Docker Compose | Local multi-service development |
-| Metrics | Prometheus | Application and worker metrics |
-| Dashboards | Grafana | Operational monitoring |
-| CI/CD | GitHub Actions | Automated testing and build checks |
-
-Redis is used for queueing and coordination, not as the sole source of truth for job state. PostgreSQL remains the authoritative store for persisted job metadata and execution results.
+1. [Features](#features)
+2. [Architecture](#architecture)
+3. [Quick Start](#quick-start)
+4. [Using the API](#using-the-api)
+5. [API Reference](#api-reference)
+6. [Job Types](#job-types)
+7. [Job Lifecycle](#job-lifecycle)
+8. [How Reliability Works](#how-reliability-works)
+9. [Database Schema](#database-schema)
+10. [Security](#security)
+11. [Observability](#observability)
+12. [Configuration](#configuration)
+13. [Testing](#testing)
+14. [Performance and Recovery Results](#performance-and-recovery-results)
+15. [Project Structure](#project-structure)
+16. [Deployment](#deployment)
+17. [Design Trade-offs](#design-trade-offs)
+18. [Limitations and Future Work](#limitations-and-future-work)
 
 ---
 
-## 3. High-Level System Architecture
+## Features
+
+**Job management**
+- Submit, inspect, list (cursor pagination, status/type filters), cancel and retry jobs
+- Idempotent submission with the `Idempotency-Key` header. Replays return the original job, and a conflicting body returns `409`
+- Priorities from 0 to 9, mapped to three Redis queues and drained by weighted random choice, so low-priority work is never starved
+- Delayed execution with `scheduled_at`
+- Full attempt history per job: worker, duration, error type and sanitized message
+
+**Reliable execution**
+- Jobs are persisted in PostgreSQL **before** dispatch, through a transactional outbox
+- Atomic job claiming with conditional updates. Exactly one worker wins, even with duplicate messages
+- Execution leases with heartbeats. Every write is fenced on the attempt number, so a stale worker can never overwrite a newer result
+- Exponential backoff with jitter, a `DEAD_LETTER` state for exhausted retries, and a `FAILED` state for permanent errors
+- Per-handler execution timeouts and cooperative cancellation of running jobs
+- Graceful worker shutdown: the worker stops claiming, finishes in-flight work within a grace period, and leaves anything unfinished retryable
+- Automatic recovery of expired leases, lost Redis messages and messages held by dead workers
+
+**Production engineering**
+- JWT authentication with access and refresh tokens, Argon2 password hashing, and tenant isolation (users see only their own jobs)
+- Per-user rate limits on submission and retry, plus request-size and payload-size limits
+- Allowlisted job types with strict payload schemas. No arbitrary code execution
+- Structured JSON logs with secret redaction and log-injection protection
+- Prometheus metrics, alert rules and a provisioned Grafana dashboard
+- Alembic migrations, Docker images, a Docker Compose stack, and GitHub Actions CI against both SQLite and PostgreSQL
+
+---
+
+## Architecture
 
 ```text
-                          CLIENT APPLICATIONS
-                                  |
-                                  v
-                         +-------------------+
-                         |   FastAPI API     |
-                         | Authentication    |
-                         | Validation        |
-                         | Rate Limiting     |
-                         +-------------------+
-                                  |
-                    +-------------+-------------+
-                    |                           |
-                    v                           v
-           +----------------+          +------------------+
-           |  PostgreSQL    |          |  Redis           |
-           |                |          |                  |
-           | Job Metadata   |          | Ready Queues     |
-           | Execution Logs |          | Queue Dispatch   |
-           | Job Results    |          | Coordination     |
-           +----------------+          +------------------+
-                    ^                           |
-                    |                           v
-                    |                +----------------------+
-                    |                | Background Workers   |
-                    |                |                      |
-                    |                | Worker 1             |
-                    |                | Worker 2             |
-                    |                | Worker N             |
-                    |                +----------------------+
-                    |                           |
-                    +---------------------------+
-                                |
-                                v
-                      Job Status and Results
-                                |
-                                v
-                       Client Status API
-
-
-                  OBSERVABILITY AND OPERATIONS
-
-               +-------------------------------+
-               | Prometheus                    |
-               | API, Queue, and Worker Metrics|
-               +-------------------------------+
-                                |
-                                v
-               +-------------------------------+
-               | Grafana                       |
-               | Dashboards and Alerts         |
-               +-------------------------------+
+                              CLIENTS
+                                 |
+                                 v
+                    +--------------------------+
+                    |      FastAPI  (API)      |
+                    | auth · validation · rate |
+                    | limits · idempotency     |
+                    +--------------------------+
+                                 |  one transaction:
+                                 |  job row + outbox event
+                                 v
+   +--------------------------------------------------------------+
+   |                         PostgreSQL                           |
+   | jobs · job_attempts · outbox_events · audit_logs · users     |
+   |                (authoritative job state)                     |
+   +--------------------------------------------------------------+
+        ^            |                         ^              ^
+        |            | due events              | claim /      | expired leases,
+        |            v                         | outcome      | stale jobs
+        |   +-----------------+                |              |
+        |   |   Dispatcher    |                |     +-----------------+
+        |   | (outbox → Redis)|                |     |    Scheduler    |
+        |   +-----------------+                |     |   (recovery)    |
+        |            | job ids                 |     +-----------------+
+        |            v                         |              |
+        |   +-----------------+       +-----------------+     |
+        |   |      Redis      | ----> |  Worker 1..N    |     |
+        |   | high/normal/low | LMOVE | handler threads |     |
+        |   | queues, worker  | <---- | lease heartbeat |     |
+        |   | heartbeats      |  ack  +-----------------+     |
+        |   +-----------------+                               |
+        |            ^----------- orphaned messages ----------+
+        |
+   Prometheus  <---- /api/v1/metrics, worker/dispatcher/scheduler :9101
+        |
+     Grafana
 ```
 
-### Architecture Principles
+### Processes
 
-1. **Separation of concerns:** API processes handle requests; workers perform background execution.
-2. **Durable metadata:** Job definitions and state transitions are persisted in PostgreSQL.
-3. **Independent scaling:** API replicas and worker processes can scale separately.
-4. **Failure isolation:** A failed job should not terminate the worker or prevent unrelated jobs from executing.
-5. **Explicit execution guarantees:** The system is designed for at-least-once job delivery, with idempotent handlers used to control duplicate side effects.
-6. **Observability:** Queue health, processing latency, retries, and worker failures are measurable.
-7. **Security by default:** Clients can access only jobs they are authorized to manage.
+| Process | Command | Responsibility | Scaling |
+|---|---|---|---|
+| API | `uvicorn main:app` | Auth, validation, persistence, status queries | Stateless, run replicas behind a load balancer |
+| Dispatcher | `python -m scheduler.dispatcher` | Publishes due outbox events to Redis | Safe to run several (`FOR UPDATE SKIP LOCKED`) |
+| Scheduler | `python -m scheduler.scheduler` | Recovers expired leases, lost messages and dead workers; purges old outbox rows | Safe to run several (all writes are conditional) |
+| Worker | `python -m workers.runner` | Claims and executes jobs, renews leases, records outcomes | Scale freely; `WORKER_CONCURRENCY` slots each |
 
----
-
-## 4. Component Architecture
-
-### 4.1 API Service
-
-The API service exposes the REST interface used by clients.
-
-Responsibilities:
-
-- Authenticate clients.
-- Validate job submission requests.
-- Enforce tenant-level authorization.
-- Apply request rate limits.
-- Validate job types and execution parameters.
-- Persist job metadata.
-- Support job status queries.
-- Handle retry and cancellation requests.
-- Expose health and readiness endpoints.
-
-The API should not execute long-running jobs inside the request-handling process.
-
-A successful submission should return a job identifier promptly, allowing the client to poll for the result.
-
-### 4.2 Job Management Service
-
-The job management service implements application-level job operations.
-
-Responsibilities:
-
-- Create job records.
-- Validate permitted state transitions.
-- Enforce idempotency rules.
-- Calculate retry eligibility.
-- Record job completion and failure.
-- Manage cancellation requests.
-- Store execution metadata.
-- Maintain tenant ownership.
-
-Keeping these operations separate from HTTP routing makes the business logic easier to test.
-
-### 4.3 PostgreSQL
-
-PostgreSQL stores durable application data.
-
-Primary responsibilities:
-
-- Persist job definitions and statuses.
-- Store job parameters and results.
-- Record execution attempts.
-- Store idempotency keys.
-- Track scheduling metadata.
-- Support pagination and filtering.
-- Preserve execution history.
-
-PostgreSQL is the authoritative source for a job's persisted status.
-
-### 4.4 Redis
-
-Redis supports fast queueing and coordination.
-
-Responsibilities:
-
-- Hold ready-to-process job references.
-- Support priority-specific queues.
-- Coordinate worker dispatch.
-- Support temporary locks or leases where appropriate.
-- Provide queue statistics.
-
-Redis queue entries should generally contain job identifiers rather than entire job records.
-
-The worker retrieves the authoritative job record from PostgreSQL before execution.
-
-**Important:** Redis and PostgreSQL cannot participate in one ordinary atomic transaction. A successful database commit followed by a failed Redis enqueue can leave a persisted job undispatched. TaskFlow must explicitly handle this failure mode.
-
-The recommended design uses a transactional outbox in PostgreSQL and a separate dispatcher to publish pending dispatch events to Redis.
-
-### 4.5 Background Workers
-
-Workers execute the actual job handlers.
-
-Responsibilities:
-
-- Receive job identifiers.
-- Retrieve and validate job state.
-- Claim eligible jobs.
-- Execute registered handlers.
-- Enforce execution timeouts.
-- Record results.
-- Classify failures.
-- Schedule eligible retries.
-- Acknowledge queue messages.
-- Recover safely from shutdowns.
-
-Workers must not trust the queue message alone. Before executing a job, they must verify that the job is still eligible for execution.
-
-### 4.6 Scheduler and Recovery Service
-
-A scheduler manages delayed and recurring work.
-
-Responsibilities:
-
-- Identify jobs whose scheduled execution time has arrived.
-- Dispatch eligible jobs.
-- Create new instances of recurring jobs.
-- Recover expired worker leases.
-- Redispatch jobs that remain eligible but were never delivered.
-- Detect stale executions.
-
-The scheduler should use PostgreSQL as the source of truth for scheduled jobs and recoverable job states.
-
-### 4.7 Monitoring Service
-
-The monitoring layer exposes operational metrics.
-
-Responsibilities:
-
-- Track queue depth.
-- Measure enqueue-to-start latency.
-- Measure execution duration.
-- Count successes, failures, and retries.
-- Track active and unhealthy workers.
-- Detect jobs exceeding their execution deadlines.
-- Support operational dashboards and alerts.
-
-Metrics must not expose passwords, tokens, or sensitive job payloads.
+**Redis vs PostgreSQL:** Redis queue entries hold job IDs only. PostgreSQL is the single source of truth, and a worker always re-reads and claims the job there before running it. Redis can therefore lose or duplicate messages without corrupting job state.
 
 ---
 
-## 5. Job Lifecycle
+## Quick Start
 
-Every job follows a defined lifecycle.
+### Option A — full stack with Docker Compose
 
-```text
-                    +-------------+
-                    |   CREATED   |
-                    +-------------+
-                           |
-                           v
-                    +-------------+
-                    |   PENDING   |
-                    +-------------+
-                           |
-                           v
-                    +-------------+
-                    |   QUEUED    |
-                    +-------------+
-                           |
-                           v
-                    +-------------+
-                    |   RUNNING   |
-                    +-------------+
-                       /       \
-                      /         \
-                     v           v
-              +-----------+  +-----------+
-              | SUCCEEDED |  |  FAILED   |
-              +-----------+  +-----------+
-                                  |
-                                  v
-                            Retry Eligible?
-                              /       \
-                            Yes        No
-                             |          |
-                             v          v
-                       +-----------+  +-------------+
-                       | RETRY_WAIT|  | DEAD_LETTER|
-                       +-----------+  +-------------+
-                             |
-                             v
-                         +--------+
-                         | QUEUED |
-                         +--------+
-```
-
-Cancellation is a separate control path. A cancellation request may transition a pending job directly to `CANCELLED`; for a running job, cancellation is cooperative and depends on handler support.
-
-### Job States
-
-| State | Description |
-|---|---|
-| `PENDING` | Persisted but not yet dispatched |
-| `QUEUED` | Eligible and published for execution |
-| `RUNNING` | Claimed by a worker |
-| `RETRY_WAIT` | Failed or interrupted; awaiting retry eligibility |
-| `SUCCEEDED` | Completed successfully |
-| `FAILED` | Terminal failure |
-| `DEAD_LETTER` | Exhausted retries and retained for investigation |
-| `CANCELLED` | Cancellation completed before or during execution, where supported |
-
-State transitions must be validated. For example, a terminal job should not return to `RUNNING` without an explicit administrative or retry operation.
-
-The database should record state changes transactionally with relevant execution metadata.
-
----
-
-## 6. Job Submission and Execution Flow
-
-### Step 1: Submit a job
-
-A client sends a request to:
-
-`POST /api/v1/jobs`
-
-The API authenticates the client, validates the job type and payload, and checks the idempotency key.
-
-### Step 2: Persist the job
-
-The API opens a database transaction and:
-
-1. Creates the job record.
-2. Stores the initial state.
-3. Creates a transactional outbox event.
-4. Commits the transaction.
-
-This ensures that the job and its dispatch intent are persisted together.
-
-### Step 3: Publish the dispatch event
-
-An outbox dispatcher reads unpublished events from PostgreSQL and publishes the corresponding job identifiers to Redis.
-
-After publication, it records that the event was dispatched.
-
-If publication succeeds but recording the dispatch fails, the event may be published again. Workers must therefore tolerate duplicate deliveries.
-
-### Step 4: Claim the job
-
-A worker receives a job identifier and attempts to claim the job.
-
-The claim operation verifies that:
-
-- The job exists.
-- The job is eligible for execution.
-- The job is not cancelled.
-- The job has not exceeded its retry limit.
-- Another active worker has not already claimed it.
-
-The claim should be protected using a database transaction, row locking, or another correctly implemented atomic claim mechanism.
-
-### Step 5: Execute the job
-
-The worker loads the registered handler and executes the task.
-
-Examples include:
-
-- Sending a notification.
-- Processing a file.
-- Generating a report.
-- Running a data transformation.
-
-Untrusted clients must not be allowed to submit arbitrary Python code for execution.
-
-### Step 6: Record the outcome
-
-On success, the worker stores the result and transitions the job to `SUCCEEDED`.
-
-On failure, the worker records the error category and attempt details, then determines whether the job should be retried or marked terminal.
-
-### Step 7: Acknowledge the message
-
-The queue message is acknowledged only after the relevant execution outcome has been persisted.
-
-This ordering reduces the risk of losing work, but it does not eliminate duplicates. A worker can finish an external side effect and crash before persisting success or acknowledging the message.
-
-For that reason, job handlers must be idempotent whenever duplicate execution could cause harm.
-
----
-
-## 7. Database Schema
-
-The initial database design consists of four primary tables.
-
-### 7.1 `jobs`
-
-Stores the current state and configuration of each job.
-
-| Column | Type | Description |
-|---|---|---|
-| `id` | UUID | Primary key |
-| `tenant_id` | UUID | Owning tenant |
-| `job_type` | VARCHAR | Registered handler name |
-| `payload` | JSONB | Validated job input |
-| `status` | VARCHAR | Current lifecycle state |
-| `priority` | INTEGER | Scheduling priority |
-| `max_attempts` | INTEGER | Maximum execution attempts |
-| `attempt_count` | INTEGER | Number of claimed attempts |
-| `scheduled_at` | TIMESTAMPTZ | Earliest execution time |
-| `created_at` | TIMESTAMPTZ | Creation timestamp |
-| `updated_at` | TIMESTAMPTZ | Last update timestamp |
-| `started_at` | TIMESTAMPTZ | Current or most recent start |
-| `completed_at` | TIMESTAMPTZ | Terminal completion time |
-| `result` | JSONB | Successful result |
-| `last_error` | JSONB | Most recent failure summary |
-| `idempotency_key` | VARCHAR | Optional client-provided key |
-
-Recommended constraints and indexes:
-
-- Primary key on `id`.
-- Index on `(tenant_id, created_at DESC)`.
-- Index on `(status, scheduled_at)`.
-- Unique constraint on `(tenant_id, idempotency_key)` when the key is not null.
-- Check constraints for valid priority and attempt counts.
-
-### 7.2 `job_attempts`
-
-Stores an execution record for every attempt.
-
-| Column | Type | Description |
-|---|---|---|
-| `id` | UUID | Primary key |
-| `job_id` | UUID | Associated job |
-| `attempt_number` | INTEGER | Attempt sequence |
-| `worker_id` | VARCHAR | Worker that claimed the job |
-| `status` | VARCHAR | Attempt outcome |
-| `started_at` | TIMESTAMPTZ | Execution start |
-| `finished_at` | TIMESTAMPTZ | Execution finish |
-| `error_type` | VARCHAR | Error classification |
-| `error_message` | TEXT | Sanitized error summary |
-| `duration_ms` | BIGINT | Execution duration |
-
-Recommended constraint:
-
-- Unique constraint on `(job_id, attempt_number)`.
-
-### 7.3 `outbox_events`
-
-Stores events that must be published after a database transaction commits.
-
-| Column | Type | Description |
-|---|---|---|
-| `id` | UUID | Event identifier |
-| `job_id` | UUID | Associated job |
-| `event_type` | VARCHAR | Event category |
-| `payload` | JSONB | Event metadata |
-| `created_at` | TIMESTAMPTZ | Creation timestamp |
-| `published_at` | TIMESTAMPTZ | Publication confirmation |
-| `publish_attempts` | INTEGER | Number of publication attempts |
-
-Unpublished events must be retried. Outbox cleanup should retain sufficient history for diagnosis and operational recovery.
-
-### 7.4 `idempotency_records`
-
-An optional dedicated table can manage request deduplication independently of job lifecycle.
-
-| Column | Type | Description |
-|---|---|---|
-| `id` | UUID | Primary key |
-| `tenant_id` | UUID | Requesting tenant |
-| `idempotency_key` | VARCHAR | Client-supplied key |
-| `request_hash` | VARCHAR | Hash of normalized request content |
-| `job_id` | UUID | Associated job |
-| `created_at` | TIMESTAMPTZ | Record creation timestamp |
-| `expires_at` | TIMESTAMPTZ | Optional retention deadline |
-
-The unique constraint on `(tenant_id, idempotency_key)` prevents concurrent duplicate submissions. Reusing a key with a different request body should return a conflict rather than silently changing the original job.
-
-If a dedicated idempotency table is used, define one authoritative deduplication mechanism instead of redundantly enforcing the same policy in multiple places.
-
----
-
-## 8. API Design
-
-All endpoints use the `/api/v1` prefix.
-
-### Job Operations
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/jobs` | Submit a job |
-| `GET` | `/jobs/{job_id}` | Retrieve job details |
-| `GET` | `/jobs` | List jobs with pagination and filters |
-| `POST` | `/jobs/{job_id}/retry` | Request a retry for an eligible job |
-| `POST` | `/jobs/{job_id}/cancel` | Request cancellation |
-| `GET` | `/jobs/{job_id}/attempts` | Retrieve execution history |
-| `GET` | `/jobs/{job_id}/result` | Retrieve a successful result |
-
-### Operational Endpoints
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/health/live` | Liveness check |
-| `GET` | `/health/ready` | Readiness check |
-| `GET` | `/queues/stats` | Queue metrics |
-| `GET` | `/workers` | Worker health information |
-| `GET` | `/metrics` | Prometheus metrics, appropriately protected |
-
-### Job Submission Example
-
-Request:
-
-```http
-POST /api/v1/jobs
-Authorization: Bearer <token>
-Idempotency-Key: report-2026-001
-Content-Type: application/json
-```
-
-```json
-{
-  "job_type": "generate_report",
-  "payload": {
-    "report_id": "report-123",
-    "format": "csv"
-  },
-  "priority": 5,
-  "max_attempts": 3,
-  "scheduled_at": null
-}
-```
-
-Response:
-
-```json
-{
-  "job_id": "6fd3f5b7-9f4b-4f42-b20d-ae0b7b6c9b22",
-  "status": "PENDING",
-  "created_at": "2026-10-26T10:00:00Z"
-}
-```
-
-The API returns a successful creation response after the job and outbox event have been committed. The job may still be pending dispatch when the response is returned.
-
-A repeated request with the same idempotency key and equivalent payload should return the existing job. A conflicting payload should be rejected.
-
-### Job Status Example
-
-```json
-{
-  "job_id": "6fd3f5b7-9f4b-4f42-b20d-ae0b7b6c9b22",
-  "job_type": "generate_report",
-  "status": "SUCCEEDED",
-  "attempt_count": 1,
-  "created_at": "2026-10-26T10:00:00Z",
-  "started_at": "2026-10-26T10:00:02Z",
-  "completed_at": "2026-10-26T10:00:05Z",
-  "result": {
-    "file_name": "report.csv",
-    "records_processed": 1500
-  }
-}
-```
-
-The timestamps and values above are illustrative.
-
----
-
-## 9. Retry and Failure Handling
-
-Transient failures should not immediately cause permanent job failure.
-
-### Retry Policy
-
-Use exponential backoff with jitter.
-
-A conceptual delay formula is:
-
-`delay = min(max_delay, base_delay × 2^(attempt - 1)) + jitter`
-
-For example, a policy might use a one-second base delay, a maximum delay of five minutes, and randomized jitter. These are configurable values, not fixed system requirements.
-
-### Retryable Failures
-
-Examples include:
-
-- Temporary network failures.
-- Rate limiting from an external service.
-- Transient database connectivity problems.
-- Temporary service unavailability.
-
-### Non-Retryable Failures
-
-Examples include:
-
-- Invalid job payloads.
-- Unsupported job types.
-- Permanent validation errors.
-- Authorization failures that will not be resolved by retrying.
-
-### Dead-Letter Handling
-
-A job becomes eligible for dead-letter handling when it exhausts its permitted attempts or encounters a designated terminal failure.
-
-Dead-letter records should retain:
-
-- Job identifier.
-- Attempt history.
-- Failure classification.
-- Sanitized error details.
-- Timestamps.
-- Retry policy information.
-
-Administrative retry operations must be authenticated, authorized, audited, and subject to the same idempotency and concurrency protections as normal execution.
-
----
-
-## 10. Reliability and Concurrency
-
-### 10.1 At-Least-Once Delivery
-
-TaskFlow aims to ensure that eligible work is retried or recovered after failures.
-
-Duplicate delivery is possible. Therefore, the system does not promise exactly-once execution for arbitrary jobs or external side effects.
-
-### 10.2 Idempotency
-
-Job handlers should produce the same logical outcome when the same operation is retried.
-
-For example, a payment-related handler should use an external provider's idempotency mechanism rather than assuming that a queue message will be delivered only once.
-
-### 10.3 Atomic Job Claiming
-
-Only one active claim should be valid for a given execution attempt.
-
-Use PostgreSQL transactions and row-level locking or an equivalent atomic claim design. Redis locks alone should not be treated as proof that an old worker can no longer modify the job.
-
-### 10.4 Leases and Heartbeats
-
-Long-running jobs can maintain a lease or heartbeat.
-
-A recovery process detects expired leases and determines whether the job should be retried. Lease expiry does not prove that the original worker has stopped, so the system should use attempt identifiers or fencing tokens where stale workers could otherwise overwrite newer results.
-
-### 10.5 Transactional Outbox
-
-The outbox pattern closes the gap between committing a job record and publishing its dispatch event.
-
-It does not make PostgreSQL and Redis one atomic system. Publication can still be repeated, so consumers must remain idempotent.
-
-### 10.6 Graceful Shutdown
-
-On shutdown, a worker should:
-
-1. Stop claiming new jobs.
-2. Finish current work within a configured grace period when possible.
-3. Persist the outcome.
-4. Release or expire the execution lease safely.
-5. Leave unfinished work eligible for recovery.
-
----
-
-## 11. Security
-
-Security requirements include:
-
-- Authentication for all private endpoints.
-- Tenant-level authorization for job access.
-- Secure password hashing when passwords are used.
-- Short-lived access tokens and controlled refresh mechanisms where applicable.
-- Rate limiting on submission and retry endpoints.
-- Request-size limits and strict payload validation.
-- Allowlisted job types.
-- No arbitrary Python execution from client-supplied code.
-- Secrets supplied through environment configuration or a secrets manager.
-- TLS for production network traffic.
-- Restricted database and Redis network access.
-- Sanitized errors that do not expose credentials or internal stack traces.
-- Audit records for sensitive administrative actions.
-- Protection against log injection and sensitive-data leakage.
-
-The `/metrics` endpoint should not expose sensitive operational information publicly.
-
----
-
-## 12. Observability
-
-### Core Metrics
-
-| Metric | Purpose |
-|---|---|
-| `taskflow_jobs_submitted_total` | Total submitted jobs |
-| `taskflow_jobs_completed_total` | Completed jobs by outcome |
-| `taskflow_job_duration_seconds` | Execution duration distribution |
-| `taskflow_queue_depth` | Number of waiting jobs |
-| `taskflow_queue_wait_seconds` | Time from eligibility to execution |
-| `taskflow_job_retries_total` | Retry frequency |
-| `taskflow_worker_active_jobs` | Current active work |
-| `taskflow_worker_heartbeat_age_seconds` | Worker liveness |
-| `taskflow_outbox_pending_events` | Undispatched event backlog |
-
-Metric labels must have bounded cardinality. Avoid using individual job IDs or other unbounded identifiers as Prometheus labels.
-
-### Suggested Alerts
-
-- Queue depth remains above a configured threshold.
-- Oldest eligible job exceeds its waiting-time threshold.
-- Failure rate rises above an acceptable level.
-- No healthy workers are available.
-- Outbox publication falls behind.
-- PostgreSQL or Redis connectivity is lost.
-- Jobs repeatedly expire without completing.
-
-Thresholds should be established from measured behavior rather than chosen arbitrarily.
-
----
-
-## 13. Performance and Scalability
-
-The system should be benchmarked under controlled workloads.
-
-### Performance Goals
-
-Measure:
-
-- API submission throughput.
-- API p50, p95, and p99 latency.
-- Queue waiting time.
-- Job execution throughput.
-- Retry and failure rates.
-- Database query latency.
-- Worker utilization.
-- Recovery time after process failures.
-
-### Scaling Strategy
-
-**API layer**
-
-Run multiple stateless API replicas behind a load balancer.
-
-**Worker layer**
-
-Increase worker replicas independently of API replicas. Use bounded concurrency so workers do not exhaust database connections or overwhelm downstream services.
-
-**Database layer**
-
-Add appropriate indexes, use connection pooling, inspect query plans, and archive old execution history when retention requirements demand it.
-
-**Redis layer**
-
-Monitor queue depth, memory usage, persistence settings, and latency. Select deployment and recovery settings based on the required durability guarantees.
-
-**Priority queues**
-
-Separate queues can support priority classes, but the dispatch strategy must prevent starvation of lower-priority jobs.
-
-### Benchmarking Method
-
-Use Locust or k6 to generate a repeatable workload.
-
-Record:
-
-- Machine specifications.
-- Worker count.
-- Job type and duration.
-- Payload size.
-- Submission rate.
-- Concurrency.
-- Completion throughput.
-- Latency percentiles.
-- Failure rate.
-
-Report measured results rather than claiming a predetermined throughput before testing.
-
----
-
-## 14. Project Directory Structure
-
-```text
-taskflow/
-├── app/
-│   ├── main.py
-│   ├── api/
-│   │   ├── dependencies.py
-│   │   └── v1/
-│   │       ├── jobs.py
-│   │       ├── workers.py
-│   │       └── health.py
-│   ├── core/
-│   │   ├── config.py
-│   │   ├── security.py
-│   │   └── logging.py
-│   ├── db/
-│   │   ├── session.py
-│   │   ├── base.py
-│   │   └── models/
-│   │       ├── job.py
-│   │       ├── job_attempt.py
-│   │       ├── outbox_event.py
-│   │       └── idempotency_record.py
-│   ├── schemas/
-│   │   ├── job.py
-│   │   └── common.py
-│   ├── services/
-│   │   ├── job_service.py
-│   │   ├── dispatch_service.py
-│   │   ├── retry_service.py
-│   │   └── recovery_service.py
-│   ├── queue/
-│   │   ├── redis_client.py
-│   │   └── publisher.py
-│   ├── workers/
-│   │   ├── runner.py
-│   │   ├── registry.py
-│   │   └── handlers/
-│   │       ├── generate_report.py
-│   │       ├── process_file.py
-│   │       └── send_notification.py
-│   ├── scheduler/
-│   │   └── scheduler.py
-│   └── monitoring/
-│       └── metrics.py
-├── migrations/
-├── tests/
-│   ├── unit/
-│   ├── integration/
-│   ├── reliability/
-│   └── load/
-├── scripts/
-│   ├── create_test_jobs.py
-│   └── benchmark.py
-├── monitoring/
-│   ├── prometheus.yml
-│   └── grafana/
-├── docker/
-│   └── worker.Dockerfile
-├── .env.example
-├── .gitignore
-├── alembic.ini
-├── compose.yaml
-├── Dockerfile
-├── pyproject.toml
-└── README.md
-```
-
-This structure is a target architecture. Implement modules incrementally; do not create empty files for every component before the core workflow works.
-
----
-
-## 15. Local Development Setup
-
-### Prerequisites
-
-- Python 3.12 or another supported Python version.
-- Docker and Docker Compose.
-- Git.
-- A code editor.
-
-### Setup
-
-Clone the repository:
+Requirements: Docker with Docker Compose.
 
 ```bash
 git clone <your-repository-url>
-cd taskflow
-```
-
-Create a virtual environment:
-
-```bash
-python -m venv .venv
-```
-
-Activate it on Windows:
-
-```powershell
-.venv\Scripts\Activate.ps1
-```
-
-Activate it on Linux or macOS:
-
-```bash
-source .venv/bin/activate
-```
-
-Install dependencies using the project's configured package manager. For a pip-based setup:
-
-```bash
-pip install -e ".[dev]"
-```
-
-Create your environment configuration:
-
-```bash
+cd TaskFlow-Distributed-Job-Processing-Platform
 cp .env.example .env
+# edit .env and set JWT_SECRET_KEY, e.g.:
+#   python -c "import secrets; print(secrets.token_urlsafe(48))"
+docker compose up --build
 ```
 
-On Windows Command Prompt, use:
+This starts PostgreSQL, Redis, a one-off migration job, the API, the dispatcher, the scheduler, two workers, Prometheus and Grafana.
 
-```cmd
-copy .env.example .env
-```
+| Service | URL |
+|---|---|
+| API + interactive docs | http://localhost:8000/docs |
+| Prometheus | http://localhost:9090 |
+| Grafana (admin / admin) | http://localhost:3000 → *TaskFlow Overview* |
 
-Configure the database URL, Redis connection, authentication settings, and other required environment variables. Do not commit secrets.
+Scale workers with `docker compose up -d --scale worker=5`.
 
-Start the infrastructure:
+### Option B — run the processes yourself
+
+Requirements: Python 3.12 and [uv](https://docs.astral.sh/uv/), plus PostgreSQL and Redis (or `docker compose up -d postgres redis`).
 
 ```bash
-docker compose up -d postgres redis
+uv sync
+cp .env.example .env               # set JWT_SECRET_KEY, DATABASE_URL, REDIS_URL
+uv run alembic upgrade head
 ```
 
-Run database migrations:
+Then start each process in its own terminal:
 
 ```bash
-alembic upgrade head
+uv run uvicorn main:app --reload           # API on http://localhost:8000
+uv run python -m scheduler.dispatcher      # outbox → Redis
+uv run python -m scheduler.scheduler       # recovery
+uv run python -m workers.runner            # worker (start as many as you like)
 ```
 
-Start the API:
+`DATABASE_URL` defaults to a local SQLite file (`sqlite:///./taskflow.db`), which is fine for trying things out. Use PostgreSQL for anything concurrent.
+
+### Try it
 
 ```bash
-uvicorn app.main:app --reload
+uv run python scripts/create_test_jobs.py
 ```
 
-Start the worker in a separate terminal:
-
-```bash
-python -m app.workers.runner
-```
-
-The exact commands may change as the implementation evolves.
+This creates a demo account and submits a mix of jobs, including ones that retry and succeed, end up in dead-letter, or fail permanently. Then open http://localhost:8000/docs, log in with the printed credentials, and inspect the jobs.
 
 ---
 
-## 16. Testing Strategy
+## Using the API
 
-### Unit Tests
+A complete session with `curl`:
 
-Test:
+```bash
+# 1. Create an account (or log in with POST /auth/login)
+curl -s -X POST localhost:8000/auth/signup -H 'Content-Type: application/json' -d '{
+  "email": "me@example.com", "password": "a-strong-password",
+  "full_name": "Me", "phone_number": "5550100"
+}'
+# -> {"user_id": 1, "ascess_token": "<access>", "refresh_token": "<refresh>", ...}
 
-- Job validation.
-- State-transition rules.
-- Retry delay calculations.
-- Idempotency behavior.
-- Failure classification.
-- Authorization logic.
+TOKEN=<access>
 
-### Integration Tests
+# 2. Submit a job
+curl -s -X POST localhost:8000/api/v1/jobs \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: report-2026-001" \
+  -H 'Content-Type: application/json' -d '{
+  "job_type": "generate_report",
+  "payload": {"report_id": "report-123", "format": "csv"},
+  "priority": 5,
+  "max_attempts": 3,
+  "scheduled_at": null
+}'
+# 201 -> {"job_id": "6fd3f5b7-...", "status": "PENDING", "created_at": "...", "scheduled_at": "..."}
 
-Test:
+# 3. Check status
+curl -s localhost:8000/api/v1/jobs/$JOB_ID -H "Authorization: Bearer $TOKEN"
 
-- Job submission and persistence.
-- Outbox publication.
-- Redis dispatch.
-- Worker execution.
-- Result persistence.
-- Retry scheduling.
-- Database transaction rollback.
+# 4. Fetch the result once it has SUCCEEDED
+curl -s localhost:8000/api/v1/jobs/$JOB_ID/result -H "Authorization: Bearer $TOKEN"
+# -> {"job_id": "...", "status": "SUCCEEDED",
+#     "result": {"file_name": "report-123.csv", "records_processed": 1500, ...}}
 
-### Reliability Tests
+# 5. When the access token expires (30 min), refresh it
+curl -s -X POST localhost:8000/auth/refresh -H 'Content-Type: application/json' \
+  -d '{"refresh_token": "<refresh>"}'
+```
 
-Simulate:
-
-- Worker termination during execution.
-- Redis unavailability.
-- PostgreSQL connection loss.
-- Duplicate queue messages.
-- Repeated dispatch events.
-- Expired worker leases.
-- Concurrent retry requests.
-- Duplicate submission requests.
-- Graceful shutdown during active work.
-
-### Load Tests
-
-Measure API throughput, queue wait time, worker throughput, and latency under increasing concurrency.
-
-Every reliability fix should have a regression test.
+Sending the same request again with the same `Idempotency-Key` returns `200` and the original job. Reusing the key with a different body returns `409 Conflict`.
 
 ---
 
-## 17. Deployment Architecture
+## API Reference
 
-A production deployment can use the following logical arrangement:
+All job and operations endpoints live under `/api/v1`. Interactive OpenAPI docs are served at `/docs`.
+
+### Authentication
+
+| Method | Endpoint | Body | Returns |
+|---|---|---|---|
+| `POST` | `/auth/signup` | `email`, `password` (≥ 8 chars), `full_name`, `phone_number` | user info + `ascess_token`, `refresh_token` |
+| `POST` | `/auth/login` | `email`, `password` | `access_token`, `refresh_token` |
+| `POST` | `/auth/refresh` | `refresh_token` | new `access_token` |
+
+Send the access token as `Authorization: Bearer <token>`. Access tokens last 30 minutes and refresh tokens 7 days. A refresh token is rejected where an access token is expected, and vice versa.
+
+### Jobs (authentication required)
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/v1/jobs` | Submit a job. Optional `Idempotency-Key` header. `201` new, `200` idempotent replay |
+| `GET` | `/api/v1/jobs` | List your jobs. Query: `status`, `job_type`, `limit` (1–100), `cursor` |
+| `GET` | `/api/v1/jobs/types` | List the allowlisted job types |
+| `GET` | `/api/v1/jobs/{job_id}` | Job details, including payload, timestamps, `last_error` and `result` |
+| `GET` | `/api/v1/jobs/{job_id}/attempts` | Execution history (one row per attempt) |
+| `GET` | `/api/v1/jobs/{job_id}/result` | Result of a `SUCCEEDED` job (`409` otherwise) |
+| `POST` | `/api/v1/jobs/{job_id}/cancel` | Cancel now if not running; otherwise request cooperative cancellation |
+| `POST` | `/api/v1/jobs/{job_id}/retry` | Re-run a `FAILED`, `DEAD_LETTER` or `CANCELLED` job (audited) |
+
+**Submit body**
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `job_type` | string | — | Must be a registered type |
+| `payload` | object | `{}` | Validated against the job type's schema; ≤ 64 KB |
+| `priority` | int | `5` | 0 (lowest) – 9 (highest) |
+| `max_attempts` | int | `3` | 1 – 20 |
+| `scheduled_at` | datetime | `null` | Earliest execution time; UTC if no offset |
+
+**Pagination:** responses contain `items` and `next_cursor`. Pass `next_cursor` back as `cursor` to get the next page. The cursor is keyset-based, so pages stay stable while new jobs arrive.
+
+### Operations
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| `GET` | `/api/v1/health/live` | none | Liveness |
+| `GET` | `/api/v1/health/ready` | none | Checks PostgreSQL and Redis; `503` if either is down |
+| `GET` | `/api/v1/queues/stats` | user | Queue depths, in-flight messages, outbox backlog, job counts by status |
+| `GET` | `/api/v1/workers` | user | Registered workers, heartbeat age, health, active jobs, totals |
+| `GET` | `/api/v1/metrics` | `METRICS_TOKEN` | Prometheus metrics; disabled (`404`) when no token is configured |
+
+### Error responses
+
+| Status | Meaning |
+|---|---|
+| `401` | Missing, invalid or expired token |
+| `404` | Job does not exist **or belongs to another user** (existence is never leaked) |
+| `409` | Idempotency conflict, or the job's state does not allow the operation |
+| `413` | Request body larger than `MAX_REQUEST_BYTES` |
+| `422` | Unknown job type, invalid payload or invalid parameters |
+| `429` | Rate limit exceeded (see `Retry-After`) |
+| `500` | Unexpected error; details are logged server-side, never returned |
+
+---
+
+## Job Types
+
+Clients choose from an allowlist of registered handlers. They can never submit code. Each handler declares a payload schema (unknown fields are rejected) and a timeout.
+
+| Job type | Payload | Result | Timeout |
+|---|---|---|---|
+| `generate_report` | `report_id`, `format` (`csv`/`json`), `rows` (1–100 000, default 1500) | `file_name`, `records_processed`, `size_bytes`, `sha256` | 120 s |
+| `process_file` | `file_name`, `content` (≤ 50 000 chars), `operations` (`line_count`, `word_count`, `checksum`, `top_words`) | Requested statistics | 60 s |
+| `send_notification` | `notification_id`, `channel` (`email`/`sms`/`webhook`), `recipient`, `message` | `delivered`, `deduplicated` | 30 s |
+| `simulated_work` | `duration_ms`, `fail_until_attempt`, `failure` (`transient`/`permanent`) | `slept_ms`, `attempt` | 60 s |
+
+`send_notification` shows how to write an idempotent handler. It records each `notification_id` in Redis with `SET NX`, so a retried or duplicated job never sends twice. `simulated_work` is for demos, benchmarks and failure testing.
+
+### Adding a job type
+
+```python
+# workers/handlers/resize_image.py
+from pydantic import BaseModel, ConfigDict, Field
+from workers.context import JobContext
+from workers.errors import PermanentError
+from workers.registry import job_handler
+
+class ResizeImagePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    image_id: str
+    width: int = Field(gt=0, le=4096)
+
+@job_handler("resize_image", ResizeImagePayload, timeout_seconds=90)
+def resize_image(payload: ResizeImagePayload, ctx: JobContext) -> dict:
+    ...
+    ctx.check()          # honour cancellation / timeout / shutdown in long loops
+    ...
+    return {"image_id": payload.image_id, "width": payload.width}
+```
+
+Import the module in `workers/handlers/__init__.py`. Raise `PermanentError` for failures that retrying cannot fix and `RetryableError` for transient ones. Other exceptions are treated as retryable.
+
+---
+
+## Job Lifecycle
 
 ```text
-                    Internet / Clients
-                           |
-                           v
-                    HTTPS Load Balancer
-                           |
-                           v
-                    FastAPI Replicas
-                           |
-                +----------+----------+
-                |                     |
-                v                     v
-          PostgreSQL                Redis
-                ^                     ^
-                |                     |
-                |               Queue Dispatch
-                |                     |
-                +-----------+---------+
-                            |
-                            v
-                    Background Workers
+                 PENDING ──────────────┐
+                    │ dispatcher       │
+                    v                  │
+                 QUEUED ───────────────┤
+                    │ worker claim     │  cancel
+                    v                  │
+                 RUNNING ──────────────┼──────────> CANCELLED
+                /   |    \             │
+       success /    |     \ permanent  │
+              v     |      v error     │
+       SUCCEEDED    |     FAILED       │
+                    | retryable error  │
+                    v                  │
+     attempts left? ── no ──> DEAD_LETTER
+                    │ yes
+                    v
+               RETRY_WAIT ─────────────┘
+                    │ backoff elapsed
+                    └──────> QUEUED
 
-                  Monitoring and Alerts
-                    /             \
-                   v               v
-              Prometheus         Grafana
+   FAILED / DEAD_LETTER / CANCELLED ── manual retry ──> PENDING
 ```
 
-For a first deployment, Docker Compose is sufficient for local development. A small cloud VM or managed container service can be used for a portfolio deployment.
+| State | Meaning |
+|---|---|
+| `PENDING` | Persisted, waiting for dispatch (or for `scheduled_at`) |
+| `QUEUED` | Published to Redis |
+| `RUNNING` | Claimed by a worker holding a lease |
+| `RETRY_WAIT` | Failed with a retryable error; waiting for backoff |
+| `SUCCEEDED` | Completed; result stored |
+| `FAILED` | Permanent (non-retryable) failure |
+| `DEAD_LETTER` | Retryable failures exhausted `max_attempts` |
+| `CANCELLED` | Cancelled before or during execution |
 
-Production deployment should additionally consider:
+Transitions are defined in `jobs/state.py` and enforced by conditional `UPDATE ... WHERE status = ...` statements, so concurrent requests cannot produce illegal transitions. Cancelling a running job sets `cancel_requested`. The worker sees it at its next lease renewal, and the handler stops at its next `ctx.check()`. A manual retry is audited and grants at least one more attempt.
 
-- Automated database backups.
-- Database migration procedures.
-- TLS and secret management.
-- Resource limits.
-- Worker concurrency limits.
-- Health checks.
-- Restart policies.
-- Centralized logs.
-- Monitoring and alerting.
-- Disaster recovery and restoration testing.
-
-Do not introduce Kubernetes until there is a concrete need for its orchestration capabilities.
+**Retry backoff:** `delay = min(RETRY_MAX_DELAY, RETRY_BASE_DELAY × 2^(attempt − 1)) + uniform(0, RETRY_JITTER)`. The defaults give 1 s, 2 s, 4 s, … capped at 5 minutes.
 
 ---
 
-## 18. Implementation Roadmap
+## How Reliability Works
 
-### Phase 1: Core Job API
-- [ ] Initialize the FastAPI project.
-- [ ] Configure PostgreSQL and SQLAlchemy.
-- [ ] Create the job schema and migrations.
-- [ ] Implement job submission and retrieval.
-- [ ] Add pagination and filtering.
-- [ ] Write unit and integration tests.
+TaskFlow guarantees **at-least-once execution**. Every eligible job eventually runs, but a crash at the wrong moment can make a handler run twice. Handlers whose side effects must not repeat should be idempotent, as `send_notification` is. Exactly-once execution of arbitrary side effects is not possible without the downstream system's cooperation.
 
-### Phase 2: Asynchronous Execution
-- [ ] Add Redis.
-- [ ] Implement the worker runner.
-- [ ] Create a handler registry.
-- [ ] Execute submitted jobs asynchronously.
-- [ ] Persist job attempts and results.
-- [ ] Add basic worker health checks.
+### 1. Persist before dispatch: the transactional outbox
 
-### Phase 3: Reliable Dispatch
-- [ ] Implement the transactional outbox.
-- [ ] Add a publisher process.
-- [ ] Handle duplicate messages.
-- [ ] Implement atomic job claiming.
-- [ ] Add execution leases and recovery.
-- [ ] Test Redis and worker failure scenarios.
+`POST /jobs` writes the job row **and** an `outbox_events` row in one transaction. Nothing touches Redis during the request. The dispatcher then:
 
-### Phase 4: Advanced Job Management
-- [ ] Implement retries with exponential backoff and jitter.
-- [ ] Add dead-letter handling.
-- [ ] Add idempotency keys.
-- [ ] Implement job priorities.
-- [ ] Add scheduling.
-- [ ] Implement cooperative cancellation.
+1. Locks a batch of due events (`FOR UPDATE SKIP LOCKED`) and moves their jobs `PENDING/RETRY_WAIT → QUEUED`, then commits.
+2. Pushes the job IDs to the priority queues.
+3. Marks the events published.
 
-### Phase 5: Production Engineering
-- [ ] Add authentication and authorization.
-- [ ] Add request rate limits.
-- [ ] Add structured logging.
-- [ ] Export Prometheus metrics.
-- [ ] Build Grafana dashboards.
-- [ ] Add Docker Compose.
-- [ ] Configure CI/CD.
-- [ ] Perform load and reliability testing.
-- [ ] Document measured performance results.
+If step 2 fails (Redis down), the events stay unpublished and are retried. If the dispatcher dies between steps 2 and 3, the events are published again, and the duplicates are harmless (see 3). Scheduled jobs and retries use the same mechanism, through the event's `available_at`.
 
----
+### 2. Reliable consumption
 
-## 19. Engineering Trade-offs
+A worker moves a message from the queue into its own processing list (`LMOVE`). It removes the message (the "ack") only **after** the outcome is stored in PostgreSQL. If the worker dies, its heartbeat key expires, and the scheduler moves the message back to the queue.
 
-### Why PostgreSQL and Redis?
+### 3. Atomic claiming
 
-PostgreSQL provides durable records, transactions, constraints, and queryable execution history. Redis provides fast queueing and coordination.
+```sql
+UPDATE jobs SET status='RUNNING', attempt_count=attempt_count+1, worker_id=:me, lease_expires_at=...
+WHERE id=:id AND status='QUEUED' AND attempt_count=:seen
+```
 
-Their responsibilities are distinct, and the transactional outbox handles the gap between database commits and queue publication.
+Only one worker gets `rowcount = 1`. Every other copy of the message, whether a duplicate publish, a requeue or a stale entry, finds the job not `QUEUED` and is simply acknowledged.
 
-### Why independent workers?
+### 4. Leases and fencing
 
-Independent workers allow the system to increase execution capacity without increasing the number of API processes. They also isolate long-running tasks from HTTP request handling.
+While a handler runs, the worker renews the job's lease every `WORKER_HEARTBEAT_INTERVAL_SECONDS`. If the worker dies or stalls, the scheduler finds `RUNNING` jobs with an expired lease. It records the attempt as `LOST` and moves the job to `RETRY_WAIT`, or to `DEAD_LETTER` if no attempts are left.
 
-### Why at-least-once delivery?
+Lease expiry does not prove the old worker has stopped. Every later write is therefore fenced on `(status = RUNNING, attempt_count, worker_id)`. A worker that comes back after losing its lease cannot record a result over the newer attempt; it sees `rowcount = 0` and discards its outcome.
 
-Reliable recovery can require redelivery after uncertain failures. At-least-once delivery is a practical model, provided that duplicate execution is expected and handlers are designed accordingly.
+### 5. Timeouts, cancellation and shutdown
 
-### Why not promise exactly-once execution?
+Handlers run in a thread and receive a `JobContext`. At the timeout, cancellation request or shutdown, the context tells the handler to stop, and `ctx.check()` / `ctx.sleep()` raise inside it. A handler that ignores the signal for 2 more seconds is abandoned, and the attempt is recorded as `TIMED_OUT`. Any result it produces later is rejected by the fence.
 
-A worker may perform an external side effect and crash before recording success. Without cooperation from the downstream system or a shared transaction, the platform cannot reliably distinguish every completed side effect from an incomplete one.
+On `SIGTERM` a worker stops claiming, finishes in-flight jobs within `WORKER_SHUTDOWN_GRACE_SECONDS`, then interrupts the rest. Interrupted jobs are recorded as retryable `WorkerShutdown` failures.
 
-### Why not use microservices initially?
+### 6. Recovery loop (scheduler)
 
-A modular application with independent API, dispatcher, scheduler, and worker processes provides meaningful separation without introducing unnecessary network boundaries and operational complexity.
+| Problem | Detection | Action |
+|---|---|---|
+| Worker crashed mid-job | `RUNNING` with `lease_expires_at < now` | Attempt → `LOST`; job → `RETRY_WAIT` / `DEAD_LETTER` |
+| Worker crashed holding a message | Worker in registry, heartbeat key expired | Move its processing list back to the queue |
+| Message lost (Redis restart, eviction) | `QUEUED` longer than `QUEUED_REDISPATCH_AFTER_SECONDS` with no pending event | New outbox event → re-dispatched |
+| Outbox growth | Published events older than `OUTBOX_RETENTION_DAYS` | Deleted hourly |
+
+Each of these scenarios has a regression test in `tests/reliability/`.
 
 ---
 
-## 20. Success Criteria
+## Database Schema
 
-The initial project is complete when:
+Managed by Alembic (`alembic/versions/`).
 
-- A client can submit a job through the API.
-- The job is persisted before dispatch.
-- A background worker can execute the job independently.
-- Job status and results can be retrieved through the API.
-- Failed jobs can be retried according to policy.
-- Duplicate submission requests are handled safely.
-- Duplicate queue delivery does not corrupt job state.
-- Unpublished outbox events are recovered.
-- Worker crashes do not permanently strand eligible jobs.
-- Authentication and tenant authorization are tested.
-- Automated unit and integration tests pass.
-- The system can be started locally using documented commands.
-- Performance and recovery behavior are measured and documented.
+**`jobs`** holds the current state of each job: `id` (UUID), `tenant_id` (→ `users.id`), `job_type`, `payload` (JSONB), `status`, `priority`, `max_attempts`, `attempt_count`, `scheduled_at`, `created_at`, `updated_at`, `queued_at`, `started_at`, `completed_at`, `result` (JSONB), `last_error` (JSONB), `idempotency_key`, `request_hash`, `cancel_requested`, `worker_id`, `lease_expires_at`.
+Constraints and indexes: unique `(tenant_id, idempotency_key)`; checks on priority range and attempt counts; indexes on `(tenant_id, created_at)`, `(status, scheduled_at)` and `(status, lease_expires_at)`.
 
----
+**`job_attempts`** has one row per execution: `job_id`, `attempt_number` (unique per job), `worker_id`, `status` (`RUNNING`/`SUCCEEDED`/`FAILED`/`TIMED_OUT`/`LOST`/`CANCELLED`), `started_at`, `finished_at`, `error_type`, `error_message` (sanitized), `duration_ms`.
 
-## 21. Future Enhancements
+**`outbox_events`** holds dispatch intents: `job_id`, `event_type`, `payload`, `created_at`, `available_at`, `published_at`, `publish_attempts`, `last_error`.
 
-Potential extensions include:
+**`audit_logs`** records sensitive actions (manual retry, cancellation): `actor_user_id`, `action`, `job_id`, `details`, `created_at`.
 
-- Multi-tenant quotas.
-- Recurring jobs.
-- Workflow orchestration with task dependencies.
-- Event-driven job submission.
-- WebSocket-based status updates.
-- A React monitoring dashboard.
-- Worker autoscaling based on queue depth.
-- Per-tenant priority policies.
-- Job artifact storage using object storage.
-- OpenTelemetry distributed tracing.
-- Multi-node deployment and disaster recovery.
+**`users`** stores accounts: `id`, `full_name`, `email` (unique), `hashed_password` (Argon2), `phone_number`.
 
-These features should be added only after the core execution and recovery workflow is reliable.
+**Idempotency** uses a single mechanism: the unique `(tenant_id, idempotency_key)` constraint plus a SHA-256 `request_hash` of the normalized request. If two identical requests race, the loser hits the constraint, rolls back and returns the winner's job.
 
 ---
 
-## 22. Learning Outcomes
+## Security
 
-Building TaskFlow provides practical experience with:
+- **Authentication:** short-lived JWT access tokens and longer-lived refresh tokens, each typed so one cannot be used as the other; Argon2 password hashing.
+- **Tenant isolation:** every job query is scoped to the caller. Other tenants' jobs return `404`.
+- **No code execution:** only allowlisted job types run, and payloads are strictly validated (`extra="forbid"`).
+- **Abuse limits:** per-user rate limits on submit and retry; 1 MB request-body limit; 64 KB payload limit. The rate limiter fails open if Redis is down, so a cache outage cannot take the API down.
+- **Sanitized errors:** unhandled exceptions return a generic `500`; stack traces go only to the logs.
+- **Safe logging:** bearer tokens, `token=` query parameters, passwords and database URL credentials are redacted, and newlines are escaped to prevent log injection.
+- **Protected metrics:** `/api/v1/metrics` requires a separate bearer token and is disabled when none is set. Metric labels never include job IDs or payload data.
+- **Audit trail:** manual retries and cancellations are written to `audit_logs`.
+- **Secrets:** read from the environment or `.env`, which is git-ignored. Containers run as a non-root user, and Compose binds PostgreSQL, Redis, Prometheus and Grafana to `127.0.0.1` only.
 
-- REST API design.
-- PostgreSQL schema design and transaction management.
-- Redis-backed asynchronous processing.
-- Distributed worker coordination.
-- Idempotency and duplicate delivery.
-- Retry policies and backoff.
-- Concurrency control.
-- Failure recovery.
-- Observability and performance testing.
-- Containerized deployment.
-- Automated testing and CI/CD.
-
-The goal is not simply to process background tasks. It is to understand and demonstrate how a backend system behaves under concurrency, failures, retries, and increasing workload.
+In production, also terminate TLS at the load balancer and restrict database and Redis network access.
 
 ---
 
-**TaskFlow — Reliable background execution through durable state, distributed workers, and observable processing.**
+## Observability
+
+### Metrics
+
+| Metric | Type | Labels | Source |
+|---|---|---|---|
+| `taskflow_jobs_submitted_total` | counter | `job_type` | API |
+| `taskflow_jobs_completed_total` | counter | `job_type`, `outcome` | worker, scheduler |
+| `taskflow_job_duration_seconds` | histogram | `job_type` | worker |
+| `taskflow_queue_wait_seconds` | histogram | `job_type` | worker |
+| `taskflow_job_retries_total` | counter | `job_type` | worker, scheduler |
+| `taskflow_worker_active_jobs` | gauge | — | worker |
+| `taskflow_queue_depth` | gauge | `queue` | API (read at scrape time) |
+| `taskflow_outbox_pending_events` | gauge | — | API (read at scrape time) |
+| `taskflow_worker_heartbeat_age_seconds` | gauge | `worker_id` | API (read at scrape time) |
+| `taskflow_outbox_published_total` | counter | — | dispatcher |
+| `taskflow_recovered_total` | counter | `kind` | scheduler |
+
+The API serves metrics at `/api/v1/metrics`. Workers, the dispatcher and the scheduler each expose `:9101/metrics` on the internal network. Prometheus discovers worker replicas through Docker DNS.
+
+### Dashboard and alerts
+
+Grafana is provisioned with a **TaskFlow Overview** dashboard: queue depth, outbox backlog, active jobs, healthy workers, submission and outcome rates, p50/p95 duration and queue wait, retries, heartbeat ages and recovery actions.
+
+`monitoring/alerts.yml` defines alerts for a sustained queue backlog, slow queue wait, high failure rate, no healthy workers, outbox backlog, repeated lease expiries and down targets. The thresholds are starting points; tune them from measured behavior.
+
+### Logs
+
+Logs are JSON lines, one object per line, with `ts`, `level`, `logger` and `message`, plus `job_id`, `job_type`, `worker_id`, `attempt` and `status` where relevant. Set `LOG_JSON=false` for human-readable output in development.
+
+---
+
+## Configuration
+
+All settings come from environment variables or `.env` (see `.env.example`).
+
+| Variable | Default | Description |
+|---|---|---|
+| `JWT_SECRET_KEY` | **required** | Signing key for tokens |
+| `JWT_ALGORITHM` | `HS256` | JWT algorithm |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | `30` | Access token lifetime |
+| `REFRESH_TOKEN_EXPIRE_DAYS` | `7` | Refresh token lifetime |
+| `DATABASE_URL` | `sqlite:///./taskflow.db` | e.g. `postgresql+psycopg://user:pass@host:5432/taskflow` |
+| `REDIS_URL` | `redis://localhost:6379/0` | Redis connection |
+| `METRICS_TOKEN` | unset | Bearer token for `/api/v1/metrics` (unset disables it) |
+| `MAX_REQUEST_BYTES` | `1048576` | Maximum request body |
+| `MAX_PAYLOAD_BYTES` | `65536` | Maximum serialized job payload |
+| `RATE_LIMIT_SUBMIT_PER_MINUTE` | `60` | Per-user job submissions per minute (0 = off) |
+| `RATE_LIMIT_RETRY_PER_MINUTE` | `20` | Per-user manual retries per minute (0 = off) |
+| `RETRY_BASE_DELAY_SECONDS` | `1.0` | Backoff base |
+| `RETRY_MAX_DELAY_SECONDS` | `300.0` | Backoff cap |
+| `RETRY_JITTER_SECONDS` | `1.0` | Maximum random jitter added |
+| `WORKER_CONCURRENCY` | `4` | Job slots per worker process |
+| `WORKER_POLL_INTERVAL_SECONDS` | `0.5` | Idle poll interval |
+| `WORKER_LEASE_SECONDS` | `30` | Lease length; the main factor in crash-recovery time |
+| `WORKER_HEARTBEAT_INTERVAL_SECONDS` | `5.0` | Lease renewal / heartbeat interval |
+| `WORKER_SHUTDOWN_GRACE_SECONDS` | `30.0` | Time to finish in-flight work on shutdown |
+| `QUEUE_WEIGHTS` | `[6,3,1]` | Relative drain weights for high/normal/low queues |
+| `METRICS_PORT` | `9101` | Metrics port for worker/dispatcher/scheduler (0 = off) |
+| `DISPATCHER_BATCH_SIZE` | `100` | Outbox events per batch |
+| `DISPATCHER_INTERVAL_SECONDS` | `0.5` | Dispatcher idle interval |
+| `SCHEDULER_INTERVAL_SECONDS` | `5.0` | Recovery loop interval |
+| `QUEUED_REDISPATCH_AFTER_SECONDS` | `300` | When a still-`QUEUED` job is treated as lost |
+| `OUTBOX_RETENTION_DAYS` | `7` | Retention for published outbox events |
+| `LOG_LEVEL` | `INFO` | Log level |
+| `LOG_JSON` | `true` | JSON or plain-text logs |
+
+---
+
+## Testing
+
+```bash
+uv sync
+uv run python -m pytest
+```
+
+By default the suite uses a temporary SQLite database and an in-memory Redis, so no services are needed. To run the same tests against real infrastructure:
+
+```bash
+TEST_DATABASE_URL=postgresql+psycopg://taskflow:taskflow@localhost:5432/taskflow \
+TEST_REDIS_URL=redis://localhost:6379/0 \
+uv run python -m pytest
+```
+
+There are **112 tests**, and they pass on both SQLite and PostgreSQL 16.
+
+| Suite | Covers |
+|---|---|
+| `tests/unit` | State transitions, backoff and jitter, retry/dead-letter decisions, failure classification, handler registry and payload validation, priority queues and weighting, log sanitization |
+| `tests/integration` | Auth (expired, invalid and wrong-type tokens; refresh), tenant isolation, submission validation, size and rate limits, idempotency, pagination and filters, end-to-end execution of every handler, retries, dead-letter, manual retry, scheduling, priority routing, cancellation (pending, queued, running), timeouts, health/metrics/stats/workers endpoints, rollback on database failure |
+| `tests/reliability` | Duplicate queue messages, repeated dispatch, Redis down during dispatch and during submission, PostgreSQL down during claim, expired leases and fencing of stale workers, dead-worker message recovery, lost Redis messages, concurrent claims, concurrent retries, concurrent duplicate submissions, graceful shutdown inside and beyond the grace period |
+| `tests/load` | Locust workload (`uv sync --extra load`, then `uv run locust -f tests/load/locustfile.py --host http://localhost:8000`) |
+
+**CI** (`.github/workflows/ci.yml`) runs the suite on SQLite and on PostgreSQL + Redis service containers. It also checks that migrations apply, roll back and match the models (`alembic check`), builds both Docker images and validates the Compose file.
+
+---
+
+## Performance and Recovery Results
+
+Measured with `scripts/benchmark.py`, with every component running as a separate OS process:
+
+| Setting | Value |
+|---|---|
+| Machine | Windows 11, Intel Core (Raptor Lake), single host |
+| Database | PostgreSQL 16.2 (local), psycopg pure-Python driver |
+| Queue | Python Redis emulator (`fakeredis` TCP server), not real Redis |
+| Topology | 1 API, 1 dispatcher, 1 scheduler, 2 workers × 4 slots |
+| Workload | 1,000 `simulated_work` jobs of 50 ms, 20 concurrent clients |
+
+| Metric | Run 1 | Run 2 |
+|---|---|---|
+| Submission errors | 0 | 0 |
+| Submission throughput | 214 jobs/s | 199 jobs/s |
+| Submit latency p50 / p95 / p99 | 90 / 126 / 157 ms | 96 / 136 / 194 ms |
+| Completion throughput | 106 jobs/s | 110 jobs/s |
+| Queue wait p50 / p95 | 1.89 / 2.30 s | 1.91 / 2.26 s |
+| Jobs succeeded | 1,000 / 1,000 | 1,000 / 1,000 |
+
+Eight slots running 50 ms jobs can complete at most 160 jobs/s. The measured ≈108/s (about 68% of that) is limited by per-job database round trips through the pure-Python driver and by the Python Redis emulator. Submissions arrived about twice as fast as they were processed, so queue wait grew to around 2 s by the end of the burst. Real Redis and the compiled psycopg driver should do better.
+
+**Crash recovery.** A worker was hard-killed (no graceful shutdown) while running a 4 s job, with `WORKER_LEASE_SECONDS=6`:
+
+| Step | Result |
+|---|---|
+| Attempt 1 | `LOST` (`LeaseExpired`), recorded by the scheduler |
+| Attempt 2 | `SUCCEEDED` on the surviving worker |
+| Kill to success | 11.0 s (≈ 6 s lease + backoff + 4 s re-run) |
+| Dead worker | Removed from the registry; its in-flight message requeued |
+
+Recovery time is dominated by `WORKER_LEASE_SECONDS`, which trades recovery speed against tolerance for slow heartbeats.
+
+Reproduce against the Compose stack:
+
+```bash
+uv run python scripts/benchmark.py --base-url http://localhost:8000 --jobs 1000 --concurrency 20 --duration-ms 50
+```
+
+---
+
+## Project Structure
+
+```text
+.
+├── main.py                        # FastAPI app: routers, size limit, sanitized errors, metrics collector
+├── database.py                    # Engine, sessions, UTC datetime column type
+├── core/
+│   ├── config.py                  # Settings from environment / .env
+│   ├── security.py                # Bearer auth dependency, metrics token check
+│   ├── rate_limit.py              # Per-user Redis rate limiter
+│   └── logging.py                 # JSON logs, redaction, log-injection guard
+├── users/                         # Signup, login, refresh; User model
+├── jwtauth/auth/                  # Token creation and verification
+├── jobs/
+│   ├── state.py                   # States and allowed transitions
+│   ├── models/                    # Job, JobAttempt, OutboxEvent, AuditLog
+│   ├── schemas/job.py             # Request/response models
+│   ├── api/jobs.py                # /api/v1/jobs routes
+│   └── service/
+│       ├── job_service.py         # Submit (idempotent), list, cancel, manual retry
+│       ├── execution_service.py   # Claim, lease renewal, fenced outcome writes
+│       ├── retry_service.py       # Backoff and retry decisions
+│       ├── dispatch_service.py    # Outbox → Redis
+│       └── recovery_service.py    # Leases, lost messages, dead workers, cleanup
+├── taskqueue/                     # Redis client, priority queues, fetch/ack
+├── workers/
+│   ├── runner.py                  # Worker process
+│   ├── registry.py                # Job-type allowlist and payload validation
+│   ├── context.py, errors.py      # Stop signals; failure classification
+│   └── handlers/                  # generate_report, process_file, send_notification, simulated_work
+├── scheduler/
+│   ├── dispatcher.py              # Outbox publisher process
+│   ├── scheduler.py               # Recovery process
+│   └── loop.py                    # Shared run loop with backoff and signal handling
+├── ops/
+│   ├── api.py                     # Health, queue stats, workers, metrics endpoints
+│   └── metrics.py                 # Prometheus metric definitions
+├── alembic/                       # Migrations
+├── tests/                         # unit, integration, reliability, load
+├── scripts/                       # benchmark.py, create_test_jobs.py
+├── monitoring/                    # prometheus.yml, alerts.yml, Grafana provisioning + dashboard
+├── Dockerfile                     # API / dispatcher / scheduler image
+├── docker/worker.Dockerfile       # Worker image
+├── compose.yaml                   # Full local stack
+├── .env.example
+└── .github/workflows/ci.yml
+```
+
+---
+
+## Deployment
+
+```text
+           Internet / clients
+                  |
+           HTTPS load balancer
+                  |
+          FastAPI replicas (N)
+           /               \
+     PostgreSQL           Redis (AOF)
+           \               /
+   Dispatcher · Scheduler · Workers (M)
+                  |
+         Prometheus → Grafana
+```
+
+- Run migrations (`alembic upgrade head`) as a one-off step before starting new application versions, as the Compose `migrate` service does.
+- Run one uvicorn process per API container and scale with replicas. Prometheus counters are per-process.
+- Give workers a stop grace period longer than `WORKER_SHUTDOWN_GRACE_SECONDS` (Compose uses 35 s for 25 s).
+- Redis runs with AOF persistence. If Redis data is lost anyway, the scheduler re-dispatches affected jobs from PostgreSQL.
+- Back up PostgreSQL, since it holds all job state. Redis holds no unrecoverable data.
+- Use `credentials_file` (from a secret) instead of the inline development token in `monitoring/prometheus.yml`.
+
+---
+
+## Design Trade-offs
+
+**PostgreSQL and Redis.** PostgreSQL provides durable records, transactions, constraints and queryable history. Redis provides fast queueing and coordination. The two cannot share a transaction, so the outbox bridges them, and the database is the only source of truth.
+
+**Independent workers.** Execution capacity scales separately from the API, and long-running work never blocks request handling.
+
+**At-least-once instead of exactly-once.** A worker can finish an external side effect and crash before recording success. Without cooperation from the downstream system, no platform can tell that apart from a crash before the side effect. TaskFlow makes duplicates safe for its own state (atomic claims, fencing) and gives handlers an idempotency pattern for theirs.
+
+**Threads for handlers.** Threads keep the worker simple and portable. The cost is that Python threads cannot be killed, so timeouts rely on cooperation backed by fencing. CPU-heavy or untrusted handlers would call for process isolation.
+
+**A modular monolith, not microservices.** One codebase runs as four process types: API, dispatcher, scheduler and worker. That gives real separation without the operational cost of extra network boundaries.
+
+**Users as tenants.** Each account owns its jobs, and the tenant key is `users.id`. A multi-user organization model could be added without changing the job tables' design.
+
+---
+
+## Limitations and Future Work
+
+- Recurring (cron-style) jobs
+- Workflows with dependencies between jobs
+- Per-tenant quotas and priority policies
+- WebSocket or webhook status notifications instead of polling
+- Artifact storage (e.g. S3) for large job outputs
+- Process-isolated execution for CPU-bound or untrusted handlers
+- OpenTelemetry tracing across API, dispatcher and workers
+- Worker autoscaling from queue depth
+- Admin role for cross-tenant operations (queue stats and worker lists are currently available to any authenticated user and contain only aggregate data)
+
+---
+
+**TaskFlow — reliable background execution through durable state, distributed workers and observable processing.**
