@@ -97,6 +97,27 @@
         </section>
       </aside>
 
+      <div class="main-col">
+      <section class="card pipeline">
+        <div class="card-header">
+          <div>
+            <h2>Jobs in each stage</h2>
+            <p class="muted small">All jobs in the system, sampled every 2 seconds · last 5 minutes</p>
+          </div>
+          <span class="spacer"></span>
+          <button type="button" id="pipeline-table-toggle" class="btn ghost small-btn" aria-pressed="false">Show table</button>
+        </div>
+        <ul id="stage-legend" class="legend" aria-label="Stages"></ul>
+        <div id="pipeline-chart" class="chart" role="img" aria-label="Stacked area chart of jobs in each in-progress stage over the last five minutes"></div>
+        <div id="pipeline-table-wrap" class="table-wrap" hidden>
+          <table class="data-table">
+            <thead><tr><th>Time</th><th>Pending</th><th>Queued</th><th>Running</th><th>Retry wait</th></tr></thead>
+            <tbody id="pipeline-table"></tbody>
+          </table>
+        </div>
+        <div id="outcomes" class="outcomes" aria-label="Finished jobs"></div>
+      </section>
+
       <section class="card jobs">
         <div class="jobs-header">
           <h2>Jobs</h2>
@@ -130,6 +151,7 @@
           <span id="refresh-indicator" class="muted small">Auto-refresh on</span>
         </div>
       </section>
+      </div>
     </main>
   </div>
 
@@ -148,6 +170,18 @@
         <button type="button" id="d-retry" class="btn">Retry job</button>
         <button type="button" id="d-copy" class="btn ghost">Copy ID</button>
       </div>
+      <h3>Timeline</h3>
+      <div id="d-timeline" class="timeline"></div>
+      <ul id="d-timeline-legend" class="legend"></ul>
+      <details class="timeline-table">
+        <summary>Stage table</summary>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead><tr><th>Stage</th><th>Attempt</th><th>From</th><th>Duration</th><th>Share</th></tr></thead>
+            <tbody id="d-timeline-table"></tbody>
+          </table>
+        </div>
+      </details>
       <h3>Result</h3>
       <pre id="d-result" class="code"></pre>
       <div id="d-error-wrap" hidden>
@@ -166,6 +200,7 @@
     </div>
   </dialog>
 
+  <div id="chart-tooltip" class="chart-tooltip" role="tooltip" hidden></div>
   <div id="toasts" class="toasts" aria-live="polite"></div>
 </body>
 </html>

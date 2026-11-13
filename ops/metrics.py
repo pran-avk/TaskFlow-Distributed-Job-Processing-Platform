@@ -53,9 +53,11 @@ class QueueStateCollector(Collector):
         yield GaugeMetricFamily(
             "taskflow_worker_heartbeat_age_seconds", "Seconds since last worker heartbeat", labels=["worker_id"]
         )
+        yield GaugeMetricFamily("taskflow_jobs", "Jobs currently in each lifecycle stage", labels=["status"])
 
     def collect(self):
-        from jobs.models import OutboxEvent
+        from jobs.models import Job, OutboxEvent
+        from jobs.state import JobStatus
         from taskqueue import queues
 
         depth = GaugeMetricFamily("taskflow_queue_depth", "Jobs waiting in Redis", labels=["queue"])
@@ -63,6 +65,7 @@ class QueueStateCollector(Collector):
         heartbeat = GaugeMetricFamily(
             "taskflow_worker_heartbeat_age_seconds", "Seconds since last worker heartbeat", labels=["worker_id"]
         )
+        stages = GaugeMetricFamily("taskflow_jobs", "Jobs currently in each lifecycle stage", labels=["status"])
         try:
             client = self._redis_getter()
             for name, size in queues.queue_depths(client).items():
@@ -80,8 +83,13 @@ class QueueStateCollector(Collector):
                     select(func.count()).select_from(OutboxEvent).where(OutboxEvent.published_at.is_(None))
                 )
             outbox.add_metric([], pending or 0)
+            with self._session_factory() as db:
+                counts = dict(db.execute(select(Job.status, func.count()).group_by(Job.status)).all())
+            for status in JobStatus:  # every stage, so empty ones report 0 instead of vanishing
+                stages.add_metric([status.value], counts.get(status.value, 0))
         except Exception:
             logger.warning("Could not read outbox metrics from database")
         yield depth
         yield outbox
         yield heartbeat
+        yield stages

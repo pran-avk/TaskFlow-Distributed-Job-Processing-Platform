@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     # Infrastructure
     database_url: str = "sqlite:///./taskflow.db"
     redis_url: str = "redis://localhost:6379/0"
+    # Connections per process. The API also admits at most this many database-using
+    # requests at once, so requests can never deadlock waiting for connections.
+    db_pool_size: int = 20
 
     # Authentication. `algorithm` is accepted for compatibility with older .env files.
     jwt_secret_key: str

@@ -208,3 +208,16 @@ def test_timeout_abandons_uncooperative_handler(client, user, worker, redis_clie
     assert _job(job_id).status == "RETRY_WAIT"
     attempts = client.get(f"{JOBS}/{job_id}/attempts", headers=user["headers"]).json()
     assert attempts[0]["status"] == "TIMED_OUT"
+
+
+def test_attempt_records_when_it_was_queued(client, user, worker, redis_client):
+    """The dashboard timeline splits waiting time using each attempt's queued_at."""
+    job_id = submit(client, user["headers"], payload={"fail_until_attempt": 1})["job_id"]
+    drain(worker, redis_client)
+    attempts = client.get(f"{JOBS}/{job_id}/attempts", headers=user["headers"]).json()
+    assert len(attempts) == 2
+    for attempt in attempts:
+        assert attempt["queued_at"] is not None
+        assert attempt["queued_at"] <= attempt["started_at"]
+    detail = client.get(f"{JOBS}/{job_id}", headers=user["headers"]).json()
+    assert detail["queued_at"] is not None

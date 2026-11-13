@@ -9,11 +9,13 @@ from core.config import get_settings
 DATABASE_URL = get_settings().database_url
 
 
-def build_engine(url: str):
+def build_engine(url: str, pool_size: int):
     if url.startswith("sqlite"):
         engine = create_engine(
             url,
-            connect_args={"check_same_thread": False, "timeout": 30}
+            connect_args={"check_same_thread": False, "timeout": 30},
+            pool_size=pool_size,
+            max_overflow=0,
         )
 
         @event.listens_for(engine, "connect")
@@ -25,10 +27,10 @@ def build_engine(url: str):
 
         return engine
 
-    return create_engine(url, pool_size=10, max_overflow=10, pool_pre_ping=True)
+    return create_engine(url, pool_size=pool_size, max_overflow=0, pool_pre_ping=True)
 
 
-engine = build_engine(DATABASE_URL)
+engine = build_engine(DATABASE_URL, get_settings().db_pool_size)
 
 SessionLocal = sessionmaker(
     autocommit=False,

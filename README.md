@@ -181,8 +181,9 @@ The dashboard at `/ui` is a single page served by the API, with no build step an
 |---|---|
 | Sign in / Create account | Uses `/auth/login` and `/auth/signup`; access tokens refresh automatically |
 | New job | Pick a job type and fill in a form generated from its payload schema, or switch to raw JSON. Options: priority, max attempts, run-at time, idempotency key |
+| Jobs in each stage | Live stacked chart of how many jobs are Pending, Queued, Running and in Retry wait over the last 5 minutes, with hover details, a table view, and totals for each outcome |
 | Jobs | Live table with status badges, filters by status and type, and paging |
-| Job details | Result, last error, payload, every attempt (worker, duration, error), plus **Cancel**, **Retry** and **Copy ID** |
+| Job details | A timeline of the time the job spent in each stage (per attempt), result, last error, payload, every attempt (worker, duration, error), plus **Cancel**, **Retry** and **Copy ID** |
 | System | Queue depths, in-flight messages, outbox backlog, and live/offline workers |
 
 The page is served with a strict Content-Security-Policy (own scripts and styles only). All job data is rendered as text, never as HTML.
@@ -438,7 +439,7 @@ Managed by Alembic (`alembic/versions/`).
 **`jobs`** holds the current state of each job: `id` (UUID), `tenant_id` (→ `users.id`), `job_type`, `payload` (JSONB), `status`, `priority`, `max_attempts`, `attempt_count`, `scheduled_at`, `created_at`, `updated_at`, `queued_at`, `started_at`, `completed_at`, `result` (JSONB), `last_error` (JSONB), `idempotency_key`, `request_hash`, `cancel_requested`, `worker_id`, `lease_expires_at`.
 Constraints and indexes: unique `(tenant_id, idempotency_key)`; checks on priority range and attempt counts; indexes on `(tenant_id, created_at)`, `(status, scheduled_at)` and `(status, lease_expires_at)`.
 
-**`job_attempts`** has one row per execution: `job_id`, `attempt_number` (unique per job), `worker_id`, `status` (`RUNNING`/`SUCCEEDED`/`FAILED`/`TIMED_OUT`/`LOST`/`CANCELLED`), `started_at`, `finished_at`, `error_type`, `error_message` (sanitized), `duration_ms`.
+**`job_attempts`** has one row per execution: `job_id`, `attempt_number` (unique per job), `worker_id`, `queued_at`, `status` (`RUNNING`/`SUCCEEDED`/`FAILED`/`TIMED_OUT`/`LOST`/`CANCELLED`), `started_at`, `finished_at`, `error_type`, `error_message` (sanitized), `duration_ms`.
 
 **`outbox_events`** holds dispatch intents: `job_id`, `event_type`, `payload`, `created_at`, `available_at`, `published_at`, `publish_attempts`, `last_error`.
 
@@ -455,6 +456,7 @@ Constraints and indexes: unique `(tenant_id, idempotency_key)`; checks on priori
 - **Authentication:** short-lived JWT access tokens and longer-lived refresh tokens, each typed so one cannot be used as the other; Argon2 password hashing.
 - **Tenant isolation:** every job query is scoped to the caller. Other tenants' jobs return `404`.
 - **No code execution:** only allowlisted job types run, and payloads are strictly validated (`extra="forbid"`).
+- **Backpressure:** the API admits at most `DB_POOL_SIZE` database-using requests at once and queues the rest on the event loop, so a burst slows down instead of deadlocking the thread pool. The liveness probe never waits behind it.
 - **Abuse limits:** per-user rate limits on submit and retry; 1 MB request-body limit; 64 KB payload limit. The rate limiter fails open if Redis is down, so a cache outage cannot take the API down.
 - **Sanitized errors:** unhandled exceptions return a generic `500`; stack traces go only to the logs.
 - **Safe logging:** bearer tokens, `token=` query parameters, passwords and database URL credentials are redacted, and newlines are escaped to prevent log injection.
@@ -481,6 +483,7 @@ In production, also terminate TLS at the load balancer and restrict database and
 | `taskflow_queue_depth` | gauge | `queue` | API (read at scrape time) |
 | `taskflow_outbox_pending_events` | gauge | — | API (read at scrape time) |
 | `taskflow_worker_heartbeat_age_seconds` | gauge | `worker_id` | API (read at scrape time) |
+| `taskflow_jobs` | gauge | `status` | API (read at scrape time): jobs currently in each lifecycle stage |
 | `taskflow_outbox_published_total` | counter | — | dispatcher |
 | `taskflow_recovered_total` | counter | `kind` | scheduler |
 
@@ -488,7 +491,7 @@ The API serves metrics at `/api/v1/metrics`. Workers, the dispatcher and the sch
 
 ### Dashboard and alerts
 
-Grafana is provisioned with a **TaskFlow Overview** dashboard: queue depth, outbox backlog, active jobs, healthy workers, submission and outcome rates, p50/p95 duration and queue wait, retries, heartbeat ages and recovery actions.
+Grafana is provisioned with a **TaskFlow Overview** dashboard: jobs in each stage over time, finished jobs by outcome, queue depth, outbox backlog, active jobs, healthy workers, submission and outcome rates, p50/p95 duration and queue wait, retries, heartbeat ages and recovery actions.
 
 `monitoring/alerts.yml` defines alerts for a sustained queue backlog, slow queue wait, high failure rate, no healthy workers, outbox backlog, repeated lease expiries and down targets. The thresholds are starting points; tune them from measured behavior.
 
@@ -509,6 +512,7 @@ All settings come from environment variables or `.env` (see `.env.example`).
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | `30` | Access token lifetime |
 | `REFRESH_TOKEN_EXPIRE_DAYS` | `7` | Refresh token lifetime |
 | `DATABASE_URL` | `sqlite:///./taskflow.db` | e.g. `postgresql+psycopg://user:pass@host:5432/taskflow` |
+| `DB_POOL_SIZE` | `20` | Database connections per process; the API admits at most this many database-using requests at once |
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis connection |
 | `METRICS_TOKEN` | unset | Bearer token for `/api/v1/metrics` (unset disables it) |
 | `MAX_REQUEST_BYTES` | `1048576` | Maximum request body |
@@ -550,13 +554,13 @@ TEST_REDIS_URL=redis://localhost:6379/0 \
 uv run python -m pytest
 ```
 
-There are **117 tests**, and they pass on both SQLite and PostgreSQL 16.
+There are **121 tests**, and they pass on both SQLite and PostgreSQL 16.
 
 | Suite | Covers |
 |---|---|
 | `tests/unit` | State transitions, backoff and jitter, retry/dead-letter decisions, failure classification, handler registry and payload validation, priority queues and weighting, log sanitization |
 | `tests/integration` | Dashboard assets and security headers, job-type schemas, auth (expired, invalid and wrong-type tokens; refresh), tenant isolation, submission validation, size and rate limits, idempotency, pagination and filters, end-to-end execution of every handler, retries, dead-letter, manual retry, scheduling, priority routing, cancellation (pending, queued, running), timeouts, health/metrics/stats/workers endpoints, rollback on database failure |
-| `tests/reliability` | Duplicate queue messages, repeated dispatch, Redis down during dispatch and during submission, PostgreSQL down during claim, expired leases and fencing of stale workers, dead-worker message recovery, lost Redis messages, concurrent claims, concurrent retries, concurrent duplicate submissions, graceful shutdown inside and beyond the grace period |
+| `tests/reliability` | 150 simultaneous requests without deadlock, liveness under saturation, duplicate queue messages, repeated dispatch, Redis down during dispatch and during submission, PostgreSQL down during claim, expired leases and fencing of stale workers, dead-worker message recovery, lost Redis messages, concurrent claims, concurrent retries, concurrent duplicate submissions, graceful shutdown inside and beyond the grace period |
 | `tests/load` | Locust workload (`uv sync --extra load`, then `uv run locust -f tests/load/locustfile.py --host http://localhost:8000`) |
 
 **CI** (`.github/workflows/ci.yml`) runs the suite on SQLite and on PostgreSQL + Redis service containers. It also checks that migrations apply, roll back and match the models (`alembic check`), builds both Docker images and validates the Compose file.

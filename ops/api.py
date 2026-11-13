@@ -17,7 +17,8 @@ router = APIRouter(prefix="/api/v1", tags=["Operations"])
 
 
 @router.get("/health/live")
-def live() -> dict:
+async def live() -> dict:
+    # async: answers from the event loop even when every worker thread is busy.
     return {"status": "ok"}
 
 

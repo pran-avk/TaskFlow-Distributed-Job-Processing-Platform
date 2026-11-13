@@ -5,7 +5,23 @@
 
 const STORAGE_KEY = "taskflow.session";
 const JOBS_REFRESH_MS = 2000;
-const SYSTEM_REFRESH_MS = 5000;
+const SYSTEM_REFRESH_MS = 2000;
+const PIPELINE_WINDOW_MS = 5 * 60 * 1000;
+const SVG_NS = "http://www.w3.org/2000/svg";
+// In-progress stages, in flow order (also the stacking order, bottom to top).
+const STAGES = [
+  { key: "PENDING", label: "Pending" },
+  { key: "QUEUED", label: "Queued" },
+  { key: "RUNNING", label: "Running" },
+  { key: "RETRY_WAIT", label: "Retry wait" },
+];
+const STAGE_LABEL = Object.fromEntries(STAGES.map((s) => [s.key, s.label]));
+const OUTCOMES = [
+  { key: "SUCCEEDED", label: "Succeeded" },
+  { key: "FAILED", label: "Failed" },
+  { key: "DEAD_LETTER", label: "Dead letter" },
+  { key: "CANCELLED", label: "Cancelled" },
+];
 const TERMINAL = new Set(["SUCCEEDED", "FAILED", "DEAD_LETTER", "CANCELLED"]);
 const RETRYABLE = new Set(["FAILED", "DEAD_LETTER", "CANCELLED"]);
 
@@ -20,6 +36,9 @@ const state = {
   nextCursor: null,
   openJobId: null,
   timers: [],
+  samples: [],            // [{ t, PENDING, QUEUED, RUNNING, RETRY_WAIT }] for the pipeline chart
+  lastStats: null,
+  showPipelineTable: false,
 };
 
 // ---------------------------------------------------------------- helpers
@@ -67,6 +86,63 @@ function relativeTime(iso) {
   else if (abs < 86400) text = `${Math.floor(abs / 3600)}h`;
   else text = `${Math.floor(abs / 86400)}d`;
   return future ? `in ${text}` : `${text} ago`;
+}
+
+function svg(tag, attrs = {}, ...children) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (value !== undefined && value !== null) node.setAttribute(key, value);
+  }
+  for (const child of children.flat()) if (child) node.append(child);
+  return node;
+}
+
+function formatDuration(ms) {
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)} s`;
+  const minutes = Math.floor(ms / 60000);
+  return `${minutes}m ${Math.round((ms % 60000) / 1000)}s`;
+}
+
+function compactNumber(n) {
+  if (n < 10000) return n.toLocaleString();
+  return `${(n / 1000).toFixed(n < 100000 ? 1 : 0).replace(/\.0$/, "")}K`;
+}
+
+function niceMax(value) {
+  if (value <= 4) return 4;
+  const magnitude = 10 ** Math.floor(Math.log10(value));
+  for (const step of [1, 2, 2.5, 5, 10]) {
+    if (step * magnitude >= value) return step * magnitude;
+  }
+  return 10 * magnitude;
+}
+
+// ---------------------------------------------------------------- tooltip
+
+function showTooltip(event, title, rows, total) {
+  const tip = $("#chart-tooltip");
+  tip.replaceChildren(
+    el("div", { className: "tt-title", text: title }),
+    ...rows.map((row) =>
+      el("div", { className: `tt-row ${row.className || ""}` },
+        row.className ? el("span", { className: "swatch" }) : null,
+        el("span", { text: row.label }),
+        el("span", { className: "num", text: row.value }))),
+    total ? el("div", { className: "tt-row tt-total" }, el("span", { text: total.label }), el("span", { className: "num", text: total.value })) : null
+  );
+  tip.hidden = false;
+  const rect = tip.getBoundingClientRect();
+  let left = event.clientX + 14;
+  let top = event.clientY + 14;
+  if (left + rect.width > window.innerWidth - 8) left = event.clientX - rect.width - 14;
+  if (top + rect.height > window.innerHeight - 8) top = event.clientY - rect.height - 14;
+  tip.style.left = `${Math.max(8, left)}px`;
+  tip.style.top = `${Math.max(8, top)}px`;
+}
+
+function hideTooltip() {
+  $("#chart-tooltip").hidden = true;
 }
 
 function formatTime(iso) {
@@ -200,6 +276,8 @@ async function onSignup(event) {
 
 function signOut(message) {
   saveSession(null);
+  state.samples = [];
+  hideTooltip();
   closeJob();
   showAuth();
   if (message) toast(message, true);
@@ -425,6 +503,9 @@ async function openJob(jobId) {
   $("#d-meta").replaceChildren();
   for (const id of ["#d-result", "#d-error", "#d-payload"]) $(id).textContent = "";
   $("#d-attempts").replaceChildren();
+  $("#d-timeline").replaceChildren();
+  $("#d-timeline-legend").replaceChildren();
+  $("#d-timeline-table").replaceChildren();
   $("#d-error-wrap").hidden = true;
   const dialog = $("#job-dialog");
   if (!dialog.open) dialog.showModal();
@@ -484,6 +565,7 @@ async function renderJob() {
   );
   if (!rows.length) rows.push(el("tr", {}, el("td", { colspan: "5", className: "muted", text: "Not started yet" })));
   $("#d-attempts").replaceChildren(...rows);
+  renderTimeline(job, attempts);
 }
 
 async function jobAction(action) {
@@ -502,6 +584,7 @@ async function jobAction(action) {
 
 async function loadSystem() {
   const [stats, workers] = await Promise.all([api("/api/v1/queues/stats"), api("/api/v1/workers")]);
+  recordSample(stats);
   const stat = (value, label) =>
     el("div", { className: "stat" }, el("div", { className: "value", text: String(value) }), el("div", { className: "label", text: label }));
 
@@ -524,6 +607,260 @@ async function loadSystem() {
       stat(`${healthy}/${workers.length}`, "Healthy workers")),
     el("ul", { className: "workers" }, workerList)
   );
+}
+
+// ---------------------------------------------------------------- pipeline chart
+
+function recordSample(stats) {
+  const counts = stats.jobs_by_status || {};
+  const sample = { t: Date.now() };
+  for (const stage of STAGES) sample[stage.key] = counts[stage.key] || 0;
+  state.samples.push(sample);
+  const cutoff = sample.t - PIPELINE_WINDOW_MS;
+  while (state.samples.length && state.samples[0].t < cutoff) state.samples.shift();
+  state.lastStats = stats;
+  renderPipeline();
+}
+
+function renderPipeline() {
+  const latest = state.samples[state.samples.length - 1];
+  const counts = (state.lastStats && state.lastStats.jobs_by_status) || {};
+
+  $("#stage-legend").replaceChildren(...STAGES.map((stage) =>
+    el("li", { className: `stage-${stage.key}` },
+      el("span", { className: "swatch" }),
+      stage.label,
+      el("span", { className: "value", text: latest ? compactNumber(latest[stage.key]) : "—" }))));
+
+  $("#outcomes").replaceChildren(...OUTCOMES.map((outcome) =>
+    el("div", { className: `outcome ${outcome.key}` },
+      el("div", { className: "value", text: compactNumber(counts[outcome.key] || 0) }),
+      el("div", { className: "label", text: outcome.label }))));
+
+  renderPipelineChart();
+  if (state.showPipelineTable) renderPipelineTable();
+}
+
+function renderPipelineChart() {
+  const box = $("#pipeline-chart");
+  const width = box.clientWidth;
+  const height = box.clientHeight;
+  if (!width || !height) return;
+
+  const pad = { left: 44, right: 10, top: 10, bottom: 22 };
+  const plotWidth = width - pad.left - pad.right;
+  const plotHeight = height - pad.top - pad.bottom;
+  const now = Date.now();
+  const start = now - PIPELINE_WINDOW_MS;
+  const samples = state.samples;
+  const totals = samples.map((s) => STAGES.reduce((sum, stage) => sum + s[stage.key], 0));
+  const yMax = niceMax(Math.max(1, ...totals));
+  const x = (t) => pad.left + ((t - start) / PIPELINE_WINDOW_MS) * plotWidth;
+  const y = (v) => pad.top + plotHeight - (v / yMax) * plotHeight;
+
+  const root = svg("svg", { viewBox: `0 0 ${width} ${height}`, "aria-hidden": "true" });
+
+  for (let i = 1; i <= 4; i++) {
+    const value = (yMax * i) / 4;
+    const yy = Math.round(y(value)) + 0.5;
+    root.append(svg("line", { class: "grid", x1: pad.left, x2: width - pad.right, y1: yy, y2: yy }));
+    root.append(svg("text", { class: "tick", x: pad.left - 8, y: yy + 4, "text-anchor": "end" }, compactNumber(value)));
+  }
+  const base = Math.round(y(0)) + 0.5;
+  root.append(svg("line", { class: "baseline", x1: pad.left, x2: width - pad.right, y1: base, y2: base }));
+  root.append(svg("text", { class: "tick", x: pad.left - 8, y: base + 4, "text-anchor": "end" }, "0"));
+  for (let minutes = 5; minutes >= 0; minutes--) {
+    const label = minutes === 0 ? "now" : `−${minutes}m`;
+    const anchor = minutes === 5 ? "start" : minutes === 0 ? "end" : "middle";
+    root.append(svg("text", { class: "tick", x: x(now - minutes * 60000), y: height - 4, "text-anchor": anchor }, label));
+  }
+
+  if (samples.length < 2) {
+    root.append(svg("text", { class: "empty", x: pad.left + plotWidth / 2, y: pad.top + plotHeight / 2, "text-anchor": "middle" }, "Collecting data…"));
+    box.replaceChildren(root);
+    return;
+  }
+
+  // Stacked areas: a 12% wash per stage with a 2px edge along its top.
+  let lower = samples.map(() => 0);
+  const tops = {};
+  const edges = [];
+  for (const stage of STAGES) {
+    const upper = samples.map((s, i) => lower[i] + s[stage.key]);
+    const topPoints = samples.map((s, i) => `${x(s.t).toFixed(1)},${y(upper[i]).toFixed(1)}`);
+    const bottomPoints = samples.map((s, i) => `${x(s.t).toFixed(1)},${y(lower[i]).toFixed(1)}`).reverse();
+    root.append(svg("path", { class: `area stage-${stage.key}`, d: `M${topPoints.join("L")}L${bottomPoints.join("L")}Z` }));
+    edges.push(svg("path", { class: `edge stage-${stage.key}`, d: `M${topPoints.join("L")}` }));
+    tops[stage.key] = upper;
+    lower = upper;
+  }
+  // Paint edges top stage first, so when a thin stage sits on a thick one the thick
+  // stage's line stays visible instead of being hidden under the thin one's.
+  root.append(...edges.reverse());
+
+  // Hover layer: crosshair, ringed dots on each stage's top edge, tooltip.
+  const crosshair = svg("line", { class: "crosshair", y1: pad.top, y2: pad.top + plotHeight, visibility: "hidden" });
+  const dots = STAGES.map((stage) => svg("circle", { class: `dot stage-${stage.key}`, r: 4, visibility: "hidden" }));
+  const overlay = svg("rect", { x: pad.left, y: pad.top, width: plotWidth, height: plotHeight, fill: "transparent" });
+  overlay.addEventListener("pointermove", (event) => {
+    const bounds = root.getBoundingClientRect();
+    const px = ((event.clientX - bounds.left) / bounds.width) * width;
+    let nearest = 0;
+    for (let i = 1; i < samples.length; i++) {
+      if (Math.abs(x(samples[i].t) - px) < Math.abs(x(samples[nearest].t) - px)) nearest = i;
+    }
+    const sample = samples[nearest];
+    const sx = x(sample.t);
+    crosshair.setAttribute("x1", sx);
+    crosshair.setAttribute("x2", sx);
+    crosshair.setAttribute("visibility", "visible");
+    STAGES.forEach((stage, i) => {
+      dots[i].setAttribute("cx", sx);
+      dots[i].setAttribute("cy", y(tops[stage.key][nearest]));
+      dots[i].setAttribute("visibility", sample[stage.key] > 0 ? "visible" : "hidden");
+    });
+    showTooltip(
+      event,
+      new Date(sample.t).toLocaleTimeString(),
+      STAGES.map((stage) => ({ className: `stage-${stage.key}`, label: stage.label, value: sample[stage.key].toLocaleString() })),
+      { label: "In progress", value: totals[nearest].toLocaleString() }
+    );
+  });
+  overlay.addEventListener("pointerleave", () => {
+    crosshair.setAttribute("visibility", "hidden");
+    dots.forEach((dot) => dot.setAttribute("visibility", "hidden"));
+    hideTooltip();
+  });
+  root.append(crosshair, ...dots, overlay);
+  box.replaceChildren(root);
+}
+
+function renderPipelineTable() {
+  const rows = state.samples.slice(-10).reverse().map((sample) =>
+    el("tr", {},
+      el("td", { text: new Date(sample.t).toLocaleTimeString() }),
+      ...STAGES.map((stage) => el("td", { text: sample[stage.key].toLocaleString() }))));
+  $("#pipeline-table").replaceChildren(...rows);
+}
+
+function togglePipelineTable() {
+  state.showPipelineTable = !state.showPipelineTable;
+  $("#pipeline-table-wrap").hidden = !state.showPipelineTable;
+  const button = $("#pipeline-table-toggle");
+  button.textContent = state.showPipelineTable ? "Hide table" : "Show table";
+  button.setAttribute("aria-pressed", String(state.showPipelineTable));
+  if (state.showPipelineTable) renderPipelineTable();
+}
+
+// ---------------------------------------------------------------- job timeline
+
+function jobSegments(job, attempts) {
+  const ms = (iso) => (iso ? new Date(iso).getTime() : null);
+  const now = Date.now();
+  const terminal = TERMINAL.has(job.status);
+  const end = terminal ? (ms(job.completed_at) ?? now) : now;
+  const segments = [];
+  const push = (stage, from, to, attempt) => {
+    if (from !== null && to !== null && to > from) segments.push({ stage, from, to, attempt });
+  };
+
+  let cursor = ms(job.created_at);
+  const ordered = [...attempts].sort((a, b) => a.attempt_number - b.attempt_number);
+  ordered.forEach((attempt, i) => {
+    const waiting = i === 0 ? "PENDING" : "RETRY_WAIT";
+    const queued = ms(attempt.queued_at);
+    const started = ms(attempt.started_at);
+    if (queued !== null && queued >= cursor && queued <= started) {
+      push(waiting, cursor, queued, attempt.attempt_number);
+      push("QUEUED", queued, started, attempt.attempt_number);
+    } else {
+      push(waiting, cursor, started, attempt.attempt_number);
+    }
+    const finished = ms(attempt.finished_at) ?? (i === ordered.length - 1 ? end : started);
+    push("RUNNING", started, finished, attempt.attempt_number);
+    cursor = finished;
+  });
+
+  if (!terminal && job.status !== "RUNNING") {
+    const waiting = ordered.length ? "RETRY_WAIT" : "PENDING";
+    const queued = ms(job.queued_at);
+    if (job.status === "QUEUED" && queued !== null && queued >= cursor) {
+      push(waiting, cursor, queued);
+      push("QUEUED", queued, now);
+    } else {
+      push(job.status === "QUEUED" ? "QUEUED" : waiting, cursor, now);
+    }
+  } else if (terminal && !ordered.length) {
+    push(job.queued_at ? "QUEUED" : "PENDING", cursor, end); // cancelled before it ran
+  }
+  return segments;
+}
+
+const measureCanvas = document.createElement("canvas").getContext("2d");
+function textWidth(text) {
+  measureCanvas.font = "600 11px system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif";
+  return measureCanvas.measureText(text).width;
+}
+
+function renderTimeline(job, attempts) {
+  const segments = jobSegments(job, attempts);
+  const total = segments.reduce((sum, s) => sum + (s.to - s.from), 0);
+  const box = $("#d-timeline");
+  if (!segments.length || total <= 0) {
+    box.replaceChildren(el("p", { className: "timeline-empty", text: "No timing data yet." }));
+    $("#d-timeline-legend").replaceChildren();
+    $("#d-timeline-table").replaceChildren();
+    return;
+  }
+
+  const describeSegment = (s) => STAGE_LABEL[s.stage] + (s.attempt && s.stage !== "PENDING" ? ` · attempt ${s.attempt}` : "");
+  const blocks = segments.map((s) => {
+    const duration = s.to - s.from;
+    const share = `${Math.round((duration / total) * 100)}%`;
+    const node = el("div", {
+      className: `seg stage-${s.stage}`,
+      tabindex: "0",
+      role: "img",
+      "aria-label": `${describeSegment(s)}: ${formatDuration(duration)}, ${share} of the job's time`,
+    });
+    node.style.flex = `${duration} 1 0`;
+    const tip = (event) => showTooltip(event, describeSegment(s), [
+      { label: "Duration", value: formatDuration(duration) },
+      { label: "Share", value: share },
+      { label: "From", value: new Date(s.from).toLocaleTimeString() },
+    ]);
+    node.addEventListener("pointermove", tip);
+    node.addEventListener("pointerleave", hideTooltip);
+    node.addEventListener("focus", () => {
+      const r = node.getBoundingClientRect();
+      tip({ clientX: r.left + r.width / 2, clientY: r.bottom });
+    });
+    node.addEventListener("blur", hideTooltip);
+    return { node, label: formatDuration(duration) };
+  });
+  box.replaceChildren(...blocks.map((b) => b.node));
+  // Print a duration inside a block only when it fits with padding on both sides.
+  requestAnimationFrame(() => {
+    for (const block of blocks) {
+      if (block.node.clientWidth >= textWidth(block.label) + 14) block.node.textContent = block.label;
+    }
+  });
+
+  const perStage = new Map();
+  for (const s of segments) perStage.set(s.stage, (perStage.get(s.stage) || 0) + (s.to - s.from));
+  $("#d-timeline-legend").replaceChildren(...[...perStage].map(([stage, duration]) =>
+    el("li", { className: `stage-${stage}` },
+      el("span", { className: "swatch" }),
+      STAGE_LABEL[stage],
+      el("span", { className: "value", text: formatDuration(duration) }))));
+
+  $("#d-timeline-table").replaceChildren(...segments.map((s) =>
+    el("tr", {},
+      el("td", { text: STAGE_LABEL[s.stage] }),
+      el("td", { text: s.attempt ? String(s.attempt) : "—" }),
+      el("td", { text: new Date(s.from).toLocaleTimeString() }),
+      el("td", { text: formatDuration(s.to - s.from) }),
+      el("td", { text: `${Math.round(((s.to - s.from) / total) * 100)}%` }))));
 }
 
 // ---------------------------------------------------------------- lifecycle
@@ -583,6 +920,13 @@ function bindEvents() {
     state.pageCursors = state.pageCursors.slice(0, state.pageIndex + 1).concat(state.nextCursor);
     state.pageIndex += 1;
     loadJobs().catch((e) => toast(e.message, true));
+  });
+
+  $("#pipeline-table-toggle").addEventListener("click", togglePipelineTable);
+  let resizeFrame = 0;
+  window.addEventListener("resize", () => {
+    cancelAnimationFrame(resizeFrame);
+    resizeFrame = requestAnimationFrame(renderPipelineChart);
   });
 
   $("#d-close").addEventListener("click", closeJob);

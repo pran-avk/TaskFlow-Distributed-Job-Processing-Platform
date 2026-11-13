@@ -69,6 +69,7 @@ class JobSummary(BaseModel):
 class JobDetail(JobSummary):
     payload: dict
     updated_at: datetime
+    queued_at: datetime | None
     started_at: datetime | None
     cancel_requested: bool
     idempotency_key: str | None
@@ -81,6 +82,7 @@ class JobDetail(JobSummary):
             **JobSummary.from_job(job).model_dump(),
             payload=job.payload,
             updated_at=job.updated_at,
+            queued_at=job.queued_at,
             started_at=job.started_at,
             cancel_requested=job.cancel_requested,
             idempotency_key=job.idempotency_key,
@@ -98,6 +100,7 @@ class JobAttemptResponse(BaseModel):
     attempt_number: int
     worker_id: str
     status: str
+    queued_at: datetime | None
     started_at: datetime
     finished_at: datetime | None
     error_type: str | None
@@ -110,6 +113,7 @@ class JobAttemptResponse(BaseModel):
             attempt_number=attempt.attempt_number,
             worker_id=attempt.worker_id,
             status=attempt.status,
+            queued_at=attempt.queued_at,
             started_at=attempt.started_at,
             finished_at=attempt.finished_at,
             error_type=attempt.error_type,

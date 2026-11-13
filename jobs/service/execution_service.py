@@ -86,6 +86,7 @@ def claim_job(db: Session, job_id: uuid.UUID, worker_id: str, lease_seconds: int
         attempt_number=attempt_number,
         worker_id=worker_id,
         status=AttemptStatus.RUNNING,
+        queued_at=job.queued_at,
         started_at=now,
     ))
     db.commit()

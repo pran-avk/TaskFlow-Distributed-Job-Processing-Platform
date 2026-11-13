@@ -130,8 +130,7 @@
       ]
     },
     {
-      "id": 4,
-      "title": "Queue depth",
+      "title": "Jobs in each stage (in progress)",
       "type": "timeseries",
       "datasource": {
         "type": "prometheus",
@@ -140,6 +139,284 @@
       "gridPos": {
         "x": 0,
         "y": 4,
+        "w": 16,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "PENDING"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "QUEUED"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "RUNNING"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "RETRY_WAIT"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "taskflow-prometheus"
+          },
+          "expr": "taskflow_jobs{status=\"PENDING\"}",
+          "legendFormat": "PENDING"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "taskflow-prometheus"
+          },
+          "expr": "taskflow_jobs{status=\"QUEUED\"}",
+          "legendFormat": "QUEUED"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "taskflow-prometheus"
+          },
+          "expr": "taskflow_jobs{status=\"RUNNING\"}",
+          "legendFormat": "RUNNING"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "taskflow-prometheus"
+          },
+          "expr": "taskflow_jobs{status=\"RETRY_WAIT\"}",
+          "legendFormat": "RETRY_WAIT"
+        }
+      ],
+      "id": 4
+    },
+    {
+      "title": "Finished jobs by outcome",
+      "type": "bargauge",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "taskflow-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 4,
+        "w": 8,
+        "h": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "SUCCEEDED"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#0ca30c"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "FAILED"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d03b3b"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "DEAD_LETTER"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#ec835a"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "CANCELLED"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#898781"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "basic",
+        "showUnfilled": true,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "valueMode": "text"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "taskflow-prometheus"
+          },
+          "expr": "taskflow_jobs{status=\"SUCCEEDED\"}",
+          "legendFormat": "SUCCEEDED"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "taskflow-prometheus"
+          },
+          "expr": "taskflow_jobs{status=\"FAILED\"}",
+          "legendFormat": "FAILED"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "taskflow-prometheus"
+          },
+          "expr": "taskflow_jobs{status=\"DEAD_LETTER\"}",
+          "legendFormat": "DEAD_LETTER"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "taskflow-prometheus"
+          },
+          "expr": "taskflow_jobs{status=\"CANCELLED\"}",
+          "legendFormat": "CANCELLED"
+        }
+      ],
+      "id": 5
+    },
+    {
+      "id": 6,
+      "title": "Queue depth",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "taskflow-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 13,
         "w": 12,
         "h": 8
       },
@@ -163,7 +440,7 @@
       ]
     },
     {
-      "id": 5,
+      "id": 7,
       "title": "Submissions / s",
       "type": "timeseries",
       "datasource": {
@@ -172,7 +449,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 4,
+        "y": 13,
         "w": 12,
         "h": 8
       },
@@ -196,7 +473,7 @@
       ]
     },
     {
-      "id": 6,
+      "id": 8,
       "title": "Attempt outcomes / s",
       "type": "timeseries",
       "datasource": {
@@ -205,7 +482,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 12,
+        "y": 21,
         "w": 12,
         "h": 8
       },
@@ -229,7 +506,7 @@
       ]
     },
     {
-      "id": 7,
+      "id": 9,
       "title": "Execution duration (p50 / p95)",
       "type": "timeseries",
       "datasource": {
@@ -238,7 +515,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 12,
+        "y": 21,
         "w": 12,
         "h": 8
       },
@@ -271,7 +548,7 @@
       ]
     },
     {
-      "id": 8,
+      "id": 10,
       "title": "Queue wait (p50 / p95)",
       "type": "timeseries",
       "datasource": {
@@ -280,7 +557,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 20,
+        "y": 29,
         "w": 12,
         "h": 8
       },
@@ -313,7 +590,7 @@
       ]
     },
     {
-      "id": 9,
+      "id": 11,
       "title": "Retries / s",
       "type": "timeseries",
       "datasource": {
@@ -322,7 +599,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 20,
+        "y": 29,
         "w": 12,
         "h": 8
       },
@@ -346,7 +623,7 @@
       ]
     },
     {
-      "id": 10,
+      "id": 12,
       "title": "Worker heartbeat age",
       "type": "timeseries",
       "datasource": {
@@ -355,7 +632,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 28,
+        "y": 37,
         "w": 12,
         "h": 8
       },
@@ -379,7 +656,7 @@
       ]
     },
     {
-      "id": 11,
+      "id": 13,
       "title": "Recovery actions",
       "type": "timeseries",
       "datasource": {
@@ -388,7 +665,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 28,
+        "y": 37,
         "w": 12,
         "h": 8
       },
@@ -412,7 +689,7 @@
       ]
     },
     {
-      "id": 12,
+      "id": 14,
       "title": "Outbox published / s",
       "type": "timeseries",
       "datasource": {
@@ -421,7 +698,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 36,
+        "y": 45,
         "w": 12,
         "h": 8
       },

@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import weakref
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -50,6 +52,28 @@ async def limit_request_size(request: Request, call_next):
     if request.url.path.startswith("/ui"):
         response.headers.update(UI_SECURITY_HEADERS)
     return response
+
+
+_db_slots: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
+# Paths that never touch the database skip admission control.
+_NO_DB_PREFIXES = ("/ui", "/api/v1/health/live", "/docs", "/openapi.json")
+
+
+@app.middleware("http")
+async def limit_database_concurrency(request: Request, call_next):
+    """Admit at most `db_pool_size` database-using requests at once. Requests hold a
+    connection between sync steps that each need a threadpool thread; without this
+    bound, a burst can leave every thread waiting for a connection while every
+    connection holder waits for a thread. Excess requests wait here, on the event
+    loop, without holding a thread or a connection."""
+    if request.url.path.startswith(_NO_DB_PREFIXES):
+        return await call_next(request)
+    loop = asyncio.get_running_loop()
+    slots = _db_slots.get(loop)
+    if slots is None:
+        slots = _db_slots[loop] = asyncio.Semaphore(settings.db_pool_size)
+    async with slots:
+        return await call_next(request)
 
 
 @app.exception_handler(Exception)

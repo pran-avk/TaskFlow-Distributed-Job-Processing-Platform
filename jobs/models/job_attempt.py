@@ -19,6 +19,8 @@ class JobAttempt(Base):
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
     worker_id: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default=AttemptStatus.RUNNING)
+    # When this attempt was published to the queue; with started_at it splits waiting time per stage.
+    queued_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     started_at: Mapped[datetime] = mapped_column(UTCDateTime, nullable=False, default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
     error_type: Mapped[str | None] = mapped_column(String(100))

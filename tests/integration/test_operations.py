@@ -57,3 +57,13 @@ def test_workers_endpoint_reports_heartbeats(client, user, worker):
     assert workers[0]["worker_id"] == "test-worker"
     assert workers[0]["healthy"] is True
     assert workers[0]["state"] == "running"
+
+
+def test_metrics_report_jobs_in_every_stage(client, user, redis_client):
+    submit(client, user["headers"])
+    submit(client, user["headers"])
+    dispatch(redis_client)
+    text = client.get("/api/v1/metrics", headers={"Authorization": "Bearer test-metrics-token"}).text
+    assert 'taskflow_jobs{status="QUEUED"} 2.0' in text
+    # Empty stages still report zero rather than disappearing from the graph.
+    assert 'taskflow_jobs{status="DEAD_LETTER"} 0.0' in text
