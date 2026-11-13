@@ -53,6 +53,20 @@ def registered_job_types() -> list[str]:
     return sorted(_REGISTRY)
 
 
+def job_type_schemas() -> list[dict]:
+    """Payload JSON schemas, so clients can build input forms per job type."""
+    _ensure_loaded()
+    return [
+        {
+            "job_type": spec.name,
+            "timeout_seconds": spec.timeout_seconds,
+            "description": (spec.func.__doc__ or "").strip().split("\n\n")[0] or None,
+            "payload_schema": spec.payload_model.model_json_schema(),
+        }
+        for spec in sorted(_REGISTRY.values(), key=lambda s: s.name)
+    ]
+
+
 def validate_payload(job_type: str, payload: dict) -> dict:
     """Validate and normalise a payload. Raises UnknownJobTypeError or pydantic.ValidationError."""
     spec = get_handler(job_type)

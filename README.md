@@ -11,7 +11,7 @@ The project is about how a backend behaves under concurrency and failure, not ju
 1. [Features](#features)
 2. [Architecture](#architecture)
 3. [Quick Start](#quick-start)
-4. [Using the API](#using-the-api)
+4. [Using the Dashboard](#using-the-dashboard) · [Using the API](#using-the-api)
 5. [API Reference](#api-reference)
 6. [Job Types](#job-types)
 7. [Job Lifecycle](#job-lifecycle)
@@ -46,6 +46,9 @@ The project is about how a backend behaves under concurrency and failure, not ju
 - Per-handler execution timeouts and cooperative cancellation of running jobs
 - Graceful worker shutdown: the worker stops claiming, finishes in-flight work within a grace period, and leaves anything unfinished retryable
 - Automatic recovery of expired leases, lost Redis messages and messages held by dead workers
+
+**Web dashboard**
+- Built-in UI at `/ui`: sign in, submit jobs through forms generated from each job type's schema, watch jobs update live, inspect results and attempts, cancel and retry, and see queue and worker health
 
 **Production engineering**
 - JWT authentication with access and refresh tokens, Argon2 password hashing, and tenant isolation (users see only their own jobs)
@@ -130,6 +133,7 @@ This starts PostgreSQL, Redis, a one-off migration job, the API, the dispatcher,
 
 | Service | URL |
 |---|---|
+| **Dashboard** | http://localhost:8000/ui |
 | API + interactive docs | http://localhost:8000/docs |
 | Prometheus | http://localhost:9090 |
 | Grafana (admin / admin) | http://localhost:3000 → *TaskFlow Overview* |
@@ -159,11 +163,29 @@ uv run python -m workers.runner            # worker (start as many as you like)
 
 ### Try it
 
+Open **http://localhost:8000/ui**, create an account, and submit a job from the **New job** form. The jobs table refreshes every 2 seconds, so you can watch the status move from `PENDING` to `SUCCEEDED`. Click a job to see its result and every attempt, or to cancel or retry it.
+
+To load a mix of sample jobs, including ones that retry and succeed, end up in dead-letter, or fail permanently:
+
 ```bash
 uv run python scripts/create_test_jobs.py
 ```
 
-This creates a demo account and submits a mix of jobs, including ones that retry and succeed, end up in dead-letter, or fail permanently. Then open http://localhost:8000/docs, log in with the printed credentials, and inspect the jobs.
+---
+
+## Using the Dashboard
+
+The dashboard at `/ui` is a single page served by the API, with no build step and no external scripts.
+
+| Area | What you can do |
+|---|---|
+| Sign in / Create account | Uses `/auth/login` and `/auth/signup`; access tokens refresh automatically |
+| New job | Pick a job type and fill in a form generated from its payload schema, or switch to raw JSON. Options: priority, max attempts, run-at time, idempotency key |
+| Jobs | Live table with status badges, filters by status and type, and paging |
+| Job details | Result, last error, payload, every attempt (worker, duration, error), plus **Cancel**, **Retry** and **Copy ID** |
+| System | Queue depths, in-flight messages, outbox backlog, and live/offline workers |
+
+The page is served with a strict Content-Security-Policy (own scripts and styles only). All job data is rendered as text, never as HTML.
 
 ---
 
@@ -232,6 +254,7 @@ Send the access token as `Authorization: Bearer <token>`. Access tokens last 30 
 | `POST` | `/api/v1/jobs` | Submit a job. Optional `Idempotency-Key` header. `201` new, `200` idempotent replay |
 | `GET` | `/api/v1/jobs` | List your jobs. Query: `status`, `job_type`, `limit` (1–100), `cursor` |
 | `GET` | `/api/v1/jobs/types` | List the allowlisted job types |
+| `GET` | `/api/v1/jobs/types/schemas` | Payload JSON schema and timeout for each job type (used by the dashboard to build forms) |
 | `GET` | `/api/v1/jobs/{job_id}` | Job details, including payload, timestamps, `last_error` and `result` |
 | `GET` | `/api/v1/jobs/{job_id}/attempts` | Execution history (one row per attempt) |
 | `GET` | `/api/v1/jobs/{job_id}/result` | Result of a `SUCCEEDED` job (`409` otherwise) |
@@ -527,12 +550,12 @@ TEST_REDIS_URL=redis://localhost:6379/0 \
 uv run python -m pytest
 ```
 
-There are **112 tests**, and they pass on both SQLite and PostgreSQL 16.
+There are **117 tests**, and they pass on both SQLite and PostgreSQL 16.
 
 | Suite | Covers |
 |---|---|
 | `tests/unit` | State transitions, backoff and jitter, retry/dead-letter decisions, failure classification, handler registry and payload validation, priority queues and weighting, log sanitization |
-| `tests/integration` | Auth (expired, invalid and wrong-type tokens; refresh), tenant isolation, submission validation, size and rate limits, idempotency, pagination and filters, end-to-end execution of every handler, retries, dead-letter, manual retry, scheduling, priority routing, cancellation (pending, queued, running), timeouts, health/metrics/stats/workers endpoints, rollback on database failure |
+| `tests/integration` | Dashboard assets and security headers, job-type schemas, auth (expired, invalid and wrong-type tokens; refresh), tenant isolation, submission validation, size and rate limits, idempotency, pagination and filters, end-to-end execution of every handler, retries, dead-letter, manual retry, scheduling, priority routing, cancellation (pending, queued, running), timeouts, health/metrics/stats/workers endpoints, rollback on database failure |
 | `tests/reliability` | Duplicate queue messages, repeated dispatch, Redis down during dispatch and during submission, PostgreSQL down during claim, expired leases and fencing of stale workers, dead-worker message recovery, lost Redis messages, concurrent claims, concurrent retries, concurrent duplicate submissions, graceful shutdown inside and beyond the grace period |
 | `tests/load` | Locust workload (`uv sync --extra load`, then `uv run locust -f tests/load/locustfile.py --host http://localhost:8000`) |
 
@@ -586,7 +609,8 @@ uv run python scripts/benchmark.py --base-url http://localhost:8000 --jobs 1000 
 
 ```text
 .
-├── main.py                        # FastAPI app: routers, size limit, sanitized errors, metrics collector
+├── main.py                        # FastAPI app: routers, dashboard, size limit, sanitized errors, metrics
+├── frontend/                      # Dashboard: index.html, app.js, styles.css (served at /ui)
 ├── database.py                    # Engine, sessions, UTC datetime column type
 ├── core/
 │   ├── config.py                  # Settings from environment / .env

@@ -19,7 +19,7 @@ from jobs.service import job_service
 from jobs.service.errors import IdempotencyConflict, InvalidJobRequest, JobNotFound, JobStateConflict
 from jobs.state import JobStatus
 from users.models.auth import User
-from workers.registry import registered_job_types
+from workers.registry import job_type_schemas, registered_job_types
 
 router = APIRouter(
     prefix="/api/v1/jobs",
@@ -40,6 +40,11 @@ def _http_error(exc: Exception) -> HTTPException:
 @router.get("/types")
 def list_job_types(user: User = Depends(get_current_user)) -> list[str]:
     return registered_job_types()
+
+
+@router.get("/types/schemas")
+def list_job_type_schemas(user: User = Depends(get_current_user)) -> list[dict]:
+    return job_type_schemas()
 
 
 @router.post(

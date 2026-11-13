@@ -14,8 +14,9 @@ class ProcessFilePayload(BaseModel):
     file_name: str = Field(min_length=1, max_length=255)
     # Content is supplied inline. Fetching arbitrary client URLs from workers would be an SSRF risk.
     content: str = Field(max_length=50_000)
+    # A literal default (not default_factory) so it appears in the JSON schema clients build forms from.
     operations: list[Literal["line_count", "word_count", "checksum", "top_words"]] = Field(
-        default_factory=lambda: ["line_count", "word_count", "checksum"],
+        default=["line_count", "word_count", "checksum"],
         min_length=1,
     )
 
